@@ -239,61 +239,6 @@ class AuthEngine implements Closeable {
 
   }
 
-  private byte[] doCipherOp(int mode, byte[] in, boolean isFinal)
-    throws GeneralSecurityException {
-
-    CryptoCipher cipher;
-    switch (mode) {
-      case Cipher.ENCRYPT_MODE:
-        cipher = encryptor;
-        break;
-      case Cipher.DECRYPT_MODE:
-        cipher = decryptor;
-        break;
-      default:
-        throw new IllegalArgumentException(String.valueOf(mode));
-    }
-
-    Preconditions.checkState(cipher != null, "Cipher is invalid because of previous error.");
-
-    try {
-      int scale = 1;
-      while (true) {
-        int size = in.length * scale;
-        byte[] buffer = new byte[size];
-        try {
-          int outSize = isFinal ? cipher.doFinal(in, 0, in.length, buffer, 0)
-            : cipher.update(in, 0, in.length, buffer, 0);
-          if (outSize != buffer.length) {
-            byte[] output = new byte[outSize];
-            System.arraycopy(buffer, 0, output, 0, output.length);
-            return output;
-          } else {
-            return buffer;
-          }
-        } catch (ShortBufferException e) {
-          // Try again with a bigger buffer.
-          scale *= 2;
-        }
-      }
-    } catch (InternalError ie) {
-      // SPARK-25535. The commons-cryto library will throw InternalError if something goes wrong,
-      // and leave bad state behind in the Java wrappers, so it's not safe to use them afterwards.
-      if (mode == Cipher.ENCRYPT_MODE) {
-        this.encryptor = null;
-      } else {
-        this.decryptor = null;
-      }
-      throw ie;
-    }
-  }
-
-  private byte[] randomBytes(int count) {
-    byte[] bytes = new byte[count];
-    random.nextBytes(bytes);
-    return bytes;
-  }
-
   /** Checks that the "test" array is in the data array starting at the given offset. */
   private void checkSubArray(byte[] test, byte[] data, int offset) {
     Preconditions.checkArgument(data.length >= test.length + offset);
