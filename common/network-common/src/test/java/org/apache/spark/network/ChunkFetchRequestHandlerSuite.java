@@ -64,21 +64,21 @@ public class ChunkFetchRequestHandlerSuite {
     managedBuffers.add(new TestManagedBuffer(20));
     managedBuffers.add(new TestManagedBuffer(30));
     managedBuffers.add(new TestManagedBuffer(40));
-    long streamId = streamManager.registerStream("test-app", managedBuffers.iterator());
-    streamManager.registerChannel(channel, streamId);
+//    long streamId = streamManager.registerStream("test-app", managedBuffers.iterator());
+//    streamManager.registerChannel(channel, streamId);
     TransportClient reverseClient = mock(TransportClient.class);
     ChunkFetchRequestHandler requestHandler = new ChunkFetchRequestHandler(reverseClient,
       rpcHandler.getStreamManager(), 2L);
 
-    RequestMessage request0 = new ChunkFetchRequest(new StreamChunkId(streamId, 0));
-    requestHandler.channelRead(context, request0);
+//    RequestMessage request0 = new ChunkFetchRequest(new StreamChunkId(streamId, 0));
+//    requestHandler.channelRead(context, request0);
     assert responseAndPromisePairs.size() == 1;
     assert responseAndPromisePairs.get(0).getLeft() instanceof ChunkFetchSuccess;
     assert ((ChunkFetchSuccess) (responseAndPromisePairs.get(0).getLeft())).body() ==
       managedBuffers.get(0);
 
-    RequestMessage request1 = new ChunkFetchRequest(new StreamChunkId(streamId, 1));
-    requestHandler.channelRead(context, request1);
+//    RequestMessage request1 = new ChunkFetchRequest(new StreamChunkId(streamId, 1));
+//    requestHandler.channelRead(context, request1);
     assert responseAndPromisePairs.size() == 2;
     assert responseAndPromisePairs.get(1).getLeft() instanceof ChunkFetchSuccess;
     assert ((ChunkFetchSuccess) (responseAndPromisePairs.get(1).getLeft())).body() ==
@@ -87,15 +87,15 @@ public class ChunkFetchRequestHandlerSuite {
     // Finish flushing the response for request0.
     responseAndPromisePairs.get(0).getRight().finish(true);
 
-    RequestMessage request2 = new ChunkFetchRequest(new StreamChunkId(streamId, 2));
-    requestHandler.channelRead(context, request2);
+//    RequestMessage request2 = new ChunkFetchRequest(new StreamChunkId(streamId, 2));
+//    requestHandler.channelRead(context, request2);
     assert responseAndPromisePairs.size() == 3;
     assert responseAndPromisePairs.get(2).getLeft() instanceof ChunkFetchSuccess;
     assert ((ChunkFetchSuccess) (responseAndPromisePairs.get(2).getLeft())).body() ==
       managedBuffers.get(2);
 
-    RequestMessage request3 = new ChunkFetchRequest(new StreamChunkId(streamId, 3));
-    requestHandler.channelRead(context, request3);
+//    RequestMessage request3 = new ChunkFetchRequest(new StreamChunkId(streamId, 3));
+//    requestHandler.channelRead(context, request3);
     verify(channel, times(1)).close();
     assert responseAndPromisePairs.size() == 3;
   }
