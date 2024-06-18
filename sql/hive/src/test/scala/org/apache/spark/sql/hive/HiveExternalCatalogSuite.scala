@@ -17,42 +17,18 @@
 
 package org.apache.spark.sql.hive
 
-import java.io.File
-import java.net.URI
-
 import org.apache.hadoop.conf.Configuration
 
 import org.apache.spark.SparkConf
 import org.apache.spark.sql.catalyst.TableIdentifier
 import org.apache.spark.sql.catalyst.catalog._
 import org.apache.spark.sql.execution.command.DDLUtils
-import org.apache.spark.sql.hive.client.{HiveClient, IsolatedClientLoader}
 import org.apache.spark.sql.types.StructType
-import org.apache.spark.util.Utils
-
 
 /**
  * Test suite for the [[HiveExternalCatalog]].
  */
 class HiveExternalCatalogSuite extends ExternalCatalogSuite {
-
-  // CDH-74147: build the list of jars from the test's classpath, so that the isolated class loader
-  // can find needed classes.
-  private val allJars = sys.props("java.class.path").split(":").map(new File(_).toURI().toURL())
-
-  private val client: HiveClient = {
-    val metaVersion = IsolatedClientLoader.hiveVersion(
-      HiveUtils.HIVE_METASTORE_VERSION.defaultValue.get)
-    new IsolatedClientLoader(
-      version = metaVersion,
-      sparkConf = new SparkConf(),
-      hadoopConf = new Configuration(),
-      execJars = allJars,
-      config = HiveUtils.newTemporaryConfiguration(useInMemoryDerby = true),
-      isolationOn = true,
-      baseClassLoader = Utils.getContextOrSparkClassLoader
-    ).createClient()
-  }
 
   private val externalCatalog: HiveExternalCatalog = {
     val catalog = new HiveExternalCatalog(new SparkConf, new Configuration)
@@ -132,49 +108,50 @@ class HiveExternalCatalogSuite extends ExternalCatalogSuite {
     assert(bucketString.contains("10"))
   }
 
+  test("SPARK-30050: analyze/rename table should not erase the bucketing metadata at hive side") {
+    val catalog = newBasicCatalog()
+    externalCatalog.client.runSqlHive(
+      """
+        |CREATE TABLE db1.t(a string, b string)
+        |CLUSTERED BY (a, b) SORTED BY (a, b) INTO 10 BUCKETS
+        |STORED AS PARQUET
+      """.stripMargin)
+
+    val bucketString1 = externalCatalog.client.runSqlHive("DESC FORMATTED db1.t")
+      .filter(_.contains("Num Buckets")).head
+    assert(bucketString1.contains("10"))
+
+    catalog.alterTableStats("db1", "t", None)
+
+    val bucketString2 = externalCatalog.client.runSqlHive("DESC FORMATTED db1.t")
+      .filter(_.contains("Num Buckets")).head
+    assert(bucketString2.contains("10"))
+
+    catalog.renameTable("db1", "t", "t2")
+
+    val bucketString3 = externalCatalog.client.runSqlHive("DESC FORMATTED db1.t2")
+      .filter(_.contains("Num Buckets")).head
+    assert(bucketString3.contains("10"))
+  }
+
   test("SPARK-23001: NullPointerException when running desc database") {
     val catalog = newBasicCatalog()
     catalog.createDatabase(newDb("dbWithNullDesc").copy(description = null), ignoreIfExists = false)
     assert(catalog.getDatabase("dbWithNullDesc").description == "")
   }
 
-  test("CDH-58542: auto-correct table location for namenode HA") {
-    // set up a configuration with two nameservices (eg. two clusters, both with HA)
-    val conf = new Configuration()
-    conf.set("dfs.nameservices", "ns1,ns2")
-    conf.set("dfs.ha.namenodes.ns1", "namenode1,namenode5")
-    conf.set("dfs.namenode.rpc-address.ns1.namenode1", "foo-1.xyz.com:8020")
-    conf.set("dfs.namenode.rpc-address.ns1.namenode5", "foo-2.xyz.com:1234")
-    conf.set("dfs.ha.namenodes.ns2", "namenode17,namenode25")
-    conf.set("dfs.namenode.rpc-address.ns2.namenode17", "blah-1.bar.com:8020")
-    conf.set("dfs.namenode.rpc-address.ns2.namenode25", "blah-2.bar.com:8020")
-    val namenodeToNameservice = HiveExternalCatalog.buildNamenodeToNameserviceMapping(conf)
-    assert(namenodeToNameservice === Map(
-      "hdfs://foo-1.xyz.com:8020" -> "hdfs://ns1",
-      "hdfs://foo-2.xyz.com:1234" -> "hdfs://ns1",
-      "hdfs://blah-1.bar.com:8020" -> "hdfs://ns2",
-      "hdfs://blah-2.bar.com:8020" -> "hdfs://ns2"
-    ))
+  test("SPARK-29498 CatalogTable to HiveTable should not change the table's ownership") {
+    val catalog = newBasicCatalog()
+    val owner = "SPARK-29498"
+    val hiveTable = CatalogTable(
+      identifier = TableIdentifier("spark_29498", Some("db1")),
+      tableType = CatalogTableType.MANAGED,
+      storage = storageFormat,
+      owner = owner,
+      schema = new StructType().add("i", "int"),
+      provider = Some("hive"))
 
-    // go through a handful of paths, making sure the right substitions (or no substitution) is
-    // applied.  If no port is given, we don't try to guess the port for making the substitution.
-    Seq(
-      "hdfs://foo-1.xyz.com:8020/" -> "hdfs://ns1/",
-      "hdfs://foo-1.xyz.com:8020/some/path" -> "hdfs://ns1/some/path",
-      "hdfs://foo-1.xyz.com:8021/some/path" -> "hdfs://foo-1.xyz.com:8021/some/path",
-      "hdfs://foo-1.xyz.com/some/path" -> "hdfs://foo-1.xyz.com/some/path",
-      "hdfs://foo-2.xyz.com:1234/some/path" -> "hdfs://ns1/some/path",
-      "hdfs://blah-1.bar.com:8020/another/path" -> "hdfs://ns2/another/path",
-      "hdfs://another.cluster.com:8020/my/path" -> "hdfs://another.cluster.com:8020/my/path",
-      "file:/some/local/path/spark-warehouse" ->
-        "file:/some/local/path/spark-warehouse",
-      "/bare/path" -> "/bare/path"
-    ).foreach { case (orig, exp) =>
-      val convertedName = HiveExternalCatalog.convertNamenodeToNameservice(
-          namenodeToNameservice,
-          new URI(orig),
-          "my_db")
-      assert( convertedName === new URI(exp))
-    }
+    catalog.createTable(hiveTable, ignoreIfExists = false)
+    assert(catalog.getTable("db1", "spark_29498").owner === owner)
   }
 }

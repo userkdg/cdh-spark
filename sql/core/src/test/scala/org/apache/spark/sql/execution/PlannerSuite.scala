@@ -22,7 +22,7 @@ import org.apache.spark.sql.{execution, DataFrame, Row}
 import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.expressions._
 import org.apache.spark.sql.catalyst.plans._
-import org.apache.spark.sql.catalyst.plans.logical.{LogicalPlan, Range, Repartition, Sort, Union}
+import org.apache.spark.sql.catalyst.plans.logical.{LocalRelation, LogicalPlan, Range, Repartition, Sort, Union}
 import org.apache.spark.sql.catalyst.plans.physical._
 import org.apache.spark.sql.execution.columnar.{InMemoryRelation, InMemoryTableScanExec}
 import org.apache.spark.sql.execution.exchange.{EnsureRequirements, ReusedExchangeExec, ReuseExchange, ShuffleExchangeExec}
@@ -228,19 +228,6 @@ class PlannerSuite extends SharedSQLContext {
       val planned1 = query1.queryExecution.executedPlan
       assert(planned1.find(_.isInstanceOf[TakeOrderedAndProjectExec]).isEmpty)
     }
-  }
-
-  test("SPARK-23375: Cached sorted data doesn't need to be re-sorted") {
-    val query = testData.select('key, 'value).sort('key.desc).cache()
-    assert(query.queryExecution.optimizedPlan.isInstanceOf[InMemoryRelation])
-    val resorted = query.sort('key.desc)
-    assert(resorted.queryExecution.optimizedPlan.collect { case s: Sort => s}.isEmpty)
-    assert(resorted.select('key).collect().map(_.getInt(0)).toSeq ==
-      (1 to 100).reverse)
-    // with a different order, the sort is needed
-    val sortedAsc = query.sort('key)
-    assert(sortedAsc.queryExecution.optimizedPlan.collect { case s: Sort => s}.size == 1)
-    assert(sortedAsc.select('key).collect().map(_.getInt(0)).toSeq == (1 to 100))
   }
 
   test("PartitioningCollection") {
@@ -697,6 +684,32 @@ class PlannerSuite extends SharedSQLContext {
     }
   }
 
+  test("SPARK-27485: EnsureRequirements.reorder should handle duplicate expressions") {
+    val plan1 = DummySparkPlan(
+      outputPartitioning = HashPartitioning(exprA :: exprB :: exprA :: Nil, 5))
+    val plan2 = DummySparkPlan()
+    val smjExec = SortMergeJoinExec(
+      leftKeys = exprA :: exprB :: exprB :: Nil,
+      rightKeys = exprA :: exprC :: exprC :: Nil,
+      joinType = Inner,
+      condition = None,
+      left = plan1,
+      right = plan2)
+    val outputPlan = EnsureRequirements(spark.sessionState.conf).apply(smjExec)
+    outputPlan match {
+      case SortMergeJoinExec(leftKeys, rightKeys, _, _,
+             SortExec(_, _,
+               ShuffleExchangeExec(HashPartitioning(leftPartitioningExpressions, _), _, _), _),
+             SortExec(_, _,
+               ShuffleExchangeExec(HashPartitioning(rightPartitioningExpressions, _), _, _), _)) =>
+        assert(leftKeys === smjExec.leftKeys)
+        assert(rightKeys === smjExec.rightKeys)
+        assert(leftKeys === leftPartitioningExpressions)
+        assert(rightKeys === rightPartitioningExpressions)
+      case _ => fail(outputPlan.toString)
+    }
+  }
+
   test("SPARK-24500: create union with stream of children") {
     val df = Union(Stream(
       Range(1, 1, 1, 1),
@@ -779,6 +792,57 @@ class PlannerSuite extends SharedSQLContext {
         Seq(1 -> "a").toDF("i", "j").join(Seq(1 -> "a").toDF("m", "n"), $"i" === $"m"),
         classOf[PartitioningCollection])
     }
+  }
+
+  test("SPARK-26812: wrong nullability for complex datatypes in union") {
+    def testUnionOutputType(input1: DataType, input2: DataType, output: DataType): Unit = {
+      val query = Union(
+        LocalRelation(StructField("a", input1)), LocalRelation(StructField("a", input2)))
+      assert(query.output.head.dataType == output)
+    }
+
+    // Map
+    testUnionOutputType(
+      MapType(StringType, StringType, valueContainsNull = false),
+      MapType(StringType, StringType, valueContainsNull = true),
+      MapType(StringType, StringType, valueContainsNull = true))
+    testUnionOutputType(
+      MapType(StringType, StringType, valueContainsNull = true),
+      MapType(StringType, StringType, valueContainsNull = false),
+      MapType(StringType, StringType, valueContainsNull = true))
+    testUnionOutputType(
+      MapType(StringType, StringType, valueContainsNull = false),
+      MapType(StringType, StringType, valueContainsNull = false),
+      MapType(StringType, StringType, valueContainsNull = false))
+
+    // Array
+    testUnionOutputType(
+      ArrayType(StringType, containsNull = false),
+      ArrayType(StringType, containsNull = true),
+      ArrayType(StringType, containsNull = true))
+    testUnionOutputType(
+      ArrayType(StringType, containsNull = true),
+      ArrayType(StringType, containsNull = false),
+      ArrayType(StringType, containsNull = true))
+    testUnionOutputType(
+      ArrayType(StringType, containsNull = false),
+      ArrayType(StringType, containsNull = false),
+      ArrayType(StringType, containsNull = false))
+
+    // Struct
+    testUnionOutputType(
+      StructType(Seq(
+        StructField("f1", StringType, nullable = false),
+        StructField("f2", StringType, nullable = true),
+        StructField("f3", StringType, nullable = false))),
+      StructType(Seq(
+        StructField("f1", StringType, nullable = true),
+        StructField("f2", StringType, nullable = false),
+        StructField("f3", StringType, nullable = false))),
+      StructType(Seq(
+        StructField("f1", StringType, nullable = true),
+        StructField("f2", StringType, nullable = true),
+        StructField("f3", StringType, nullable = false))))
   }
 }
 

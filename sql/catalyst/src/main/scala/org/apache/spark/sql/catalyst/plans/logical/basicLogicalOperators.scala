@@ -230,9 +230,19 @@ case class Union(children: Seq[LogicalPlan]) extends LogicalPlan {
   }
 
   // updating nullability to make all the children consistent
-  override def output: Seq[Attribute] =
-    children.map(_.output).transpose.map(attrs =>
-      attrs.head.withNullability(attrs.exists(_.nullable)))
+  override def output: Seq[Attribute] = {
+    children.map(_.output).transpose.map { attrs =>
+      val firstAttr = attrs.head
+      val nullable = attrs.exists(_.nullable)
+      val newDt = attrs.map(_.dataType).reduce(StructType.merge)
+      if (firstAttr.dataType == newDt) {
+        firstAttr.withNullability(nullable)
+      } else {
+        AttributeReference(firstAttr.name, newDt, nullable, firstAttr.metadata)(
+          firstAttr.exprId, firstAttr.qualifier)
+      }
+    }
+  }
 
   override lazy val resolved: Boolean = {
     // allChildrenCompatible needs to be evaluated after childrenResolved
@@ -368,7 +378,7 @@ case class AppendData(
           case (inAttr, outAttr) =>
             // names and types must match, nullability must be compatible
             inAttr.name == outAttr.name &&
-                DataType.equalsIgnoreCompatibleNullability(outAttr.dataType, inAttr.dataType) &&
+                DataType.equalsIgnoreCompatibleNullability(inAttr.dataType, outAttr.dataType) &&
                 (outAttr.nullable || !inAttr.nullable)
         }
   }
@@ -461,6 +471,9 @@ case class View(
     desc: CatalogTable,
     output: Seq[Attribute],
     child: LogicalPlan) extends LogicalPlan with MultiInstanceRelation {
+
+  @transient
+  override lazy val references: AttributeSet = AttributeSet.empty
 
   override lazy val resolved: Boolean = child.resolved
 
@@ -608,6 +621,8 @@ case class Window(
   override def output: Seq[Attribute] =
     child.output ++ windowExpressions.map(_.toAttribute)
 
+  override def producedAttributes: AttributeSet = windowOutputSet
+
   def windowOutputSet: AttributeSet = AttributeSet(windowExpressions.map(_.toAttribute))
 }
 
@@ -657,11 +672,14 @@ object Expand {
     child: LogicalPlan): Expand = {
     val attrMap = groupByAttrs.zipWithIndex.toMap
 
+    val hasDuplicateGroupingSets = groupingSetsAttrs.size !=
+      groupingSetsAttrs.map(_.map(_.exprId).toSet).distinct.size
+
     // Create an array of Projections for the child projection, and replace the projections'
     // expressions which equal GroupBy expressions with Literal(null), if those expressions
     // are not set for this grouping set.
-    val projections = groupingSetsAttrs.map { groupingSetAttrs =>
-      child.output ++ groupByAttrs.map { attr =>
+    val projections = groupingSetsAttrs.zipWithIndex.map { case (groupingSetAttrs, i) =>
+      val projAttrs = child.output ++ groupByAttrs.map { attr =>
         if (!groupingSetAttrs.contains(attr)) {
           // if the input attribute in the Invalid Grouping Expression set of for this group
           // replace it with constant null
@@ -671,11 +689,25 @@ object Expand {
         }
       // groupingId is the last output, here we use the bit mask as the concrete value for it.
       } :+ Literal.create(buildBitmask(groupingSetAttrs, attrMap), IntegerType)
+
+      if (hasDuplicateGroupingSets) {
+        // If `groupingSetsAttrs` has duplicate entries (e.g., GROUPING SETS ((key), (key))),
+        // we add one more virtual grouping attribute (`_gen_grouping_pos`) to avoid
+        // wrongly grouping rows with the same grouping ID.
+        projAttrs :+ Literal.create(i, IntegerType)
+      } else {
+        projAttrs
+      }
     }
 
     // the `groupByAttrs` has different meaning in `Expand.output`, it could be the original
     // grouping expression or null, so here we create new instance of it.
-    val output = child.output ++ groupByAttrs.map(_.newInstance) :+ gid
+    val output = if (hasDuplicateGroupingSets) {
+      val gpos = AttributeReference("_gen_grouping_pos", IntegerType, false)()
+      child.output ++ groupByAttrs.map(_.newInstance) :+ gid :+ gpos
+    } else {
+      child.output ++ groupByAttrs.map(_.newInstance) :+ gid
+    }
     Expand(projections, output, Project(child.output ++ groupByAliases, child))
   }
 }
@@ -694,6 +726,8 @@ case class Expand(
     child: LogicalPlan) extends UnaryNode {
   override def references: AttributeSet =
     AttributeSet(projections.flatten.flatMap(_.references))
+
+  override def producedAttributes: AttributeSet = AttributeSet(output diff child.output)
 
   // This operator can reuse attributes (for example making them null when doing a roll up) so
   // the constraints of the child may no longer be valid.

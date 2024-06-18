@@ -341,6 +341,7 @@ Note that Spark artifacts are tagged with a Scala version.
       <groupId>org.apache.spark</groupId>
       <artifactId>spark-sql_{{site.SCALA_BINARY_VERSION}}</artifactId>
       <version>{{site.SPARK_VERSION}}</version>
+      <scope>provided</scope>
     </dependency>
   </dependencies>
 </project>
@@ -383,7 +384,7 @@ If you are building a packaged PySpark application or library you can add it to 
 
 {% highlight python %}
     install_requires=[
-        'pyspark=={site.SPARK_VERSION}'
+        'pyspark=={{site.SPARK_VERSION}}'
     ]
 {% endhighlight %}
 

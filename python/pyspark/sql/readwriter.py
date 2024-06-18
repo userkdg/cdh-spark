@@ -60,7 +60,7 @@ class OptionUtils(object):
 class DataFrameReader(OptionUtils):
     """
     Interface used to load a :class:`DataFrame` from external storage systems
-    (e.g. file systems, key-value stores, etc). Use :func:`spark.read`
+    (e.g. file systems, key-value stores, etc). Use :attr:`SparkSession.read`
     to access this.
 
     .. versionadded:: 1.4
@@ -374,6 +374,9 @@ class DataFrameReader(OptionUtils):
                         character. By default (None), it is disabled.
         :param header: uses the first line as names of columns. If None is set, it uses the
                        default value, ``false``.
+                       .. note:: if the given path is a RDD of Strings, this header
+                       option will remove all lines same with the header if exists.
+
         :param inferSchema: infers the input schema automatically from data. It requires one extra
                        pass over the data. If None is set, it uses the default value, ``false``.
         :param enforceSchema: If it is set to ``true``, the specified or inferred schema will be
@@ -417,7 +420,11 @@ class DataFrameReader(OptionUtils):
         :param maxMalformedLogPerPartition: this parameter is no longer used since Spark 2.2.0.
                                             If specified, it is ignored.
         :param mode: allows a mode for dealing with corrupt records during parsing. If None is
-                     set, it uses the default value, ``PERMISSIVE``.
+                     set, it uses the default value, ``PERMISSIVE``. Note that Spark tries to
+                     parse only required columns in CSV under column pruning. Therefore, corrupt
+                     records can be different based on required set of fields. This behavior can
+                     be controlled by ``spark.sql.csv.parser.columnPruning.enabled``
+                     (enabled by default).
 
                 * ``PERMISSIVE`` : when it meets a corrupted record, puts the malformed string \
                   into a field configured by ``columnNameOfCorruptRecord``, and sets other \
@@ -496,8 +503,6 @@ class DataFrameReader(OptionUtils):
     def orc(self, path):
         """Loads ORC files, returning the result as a :class:`DataFrame`.
 
-        .. note:: Currently ORC support is only available together with Hive support.
-
         >>> df = spark.read.orc('python/test_support/sql/orc_partitioned')
         >>> df.dtypes
         [('a', 'bigint'), ('b', 'int'), ('c', 'int')]
@@ -524,7 +529,8 @@ class DataFrameReader(OptionUtils):
 
         :param url: a JDBC URL of the form ``jdbc:subprotocol:subname``
         :param table: the name of the table
-        :param column: the name of an integer column that will be used for partitioning;
+        :param column: the name of a column of numeric, date, or timestamp type
+                       that will be used for partitioning;
                        if this parameter is specified, then ``numPartitions``, ``lowerBound``
                        (inclusive), and ``upperBound`` (exclusive) will form partition strides
                        for generated WHERE clause expressions used to split the column
@@ -561,7 +567,7 @@ class DataFrameReader(OptionUtils):
 class DataFrameWriter(OptionUtils):
     """
     Interface used to write a :class:`DataFrame` to external storage systems
-    (e.g. file systems, key-value stores, etc). Use :func:`DataFrame.write`
+    (e.g. file systems, key-value stores, etc). Use :attr:`DataFrame.write`
     to access this.
 
     .. versionadded:: 1.4
@@ -723,7 +729,7 @@ class DataFrameWriter(OptionUtils):
         :param partitionBy: names of partitioning columns
         :param options: all other string options
 
-        >>> df.write.mode('append').parquet(os.path.join(tempfile.mkdtemp(), 'data'))
+        >>> df.write.mode("append").save(os.path.join(tempfile.mkdtemp(), 'data'))
         """
         self.mode(mode).options(**options)
         if partitionBy is not None:
@@ -931,8 +937,6 @@ class DataFrameWriter(OptionUtils):
     @since(1.5)
     def orc(self, path, mode=None, partitionBy=None, compression=None):
         """Saves the content of the :class:`DataFrame` in ORC format at the specified path.
-
-        .. note:: Currently ORC support is only available together with Hive support.
 
         :param path: the path in any Hadoop supported file system
         :param mode: specifies the behavior of the save operation when data already exists.

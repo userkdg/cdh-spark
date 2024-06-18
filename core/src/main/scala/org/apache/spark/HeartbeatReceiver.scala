@@ -22,7 +22,6 @@ import java.util.concurrent.{ScheduledFuture, TimeUnit}
 import scala.collection.mutable
 import scala.concurrent.Future
 
-import org.apache.spark.executor.ExecutorMetrics
 import org.apache.spark.internal.Logging
 import org.apache.spark.rpc.{RpcCallContext, RpcEnv, ThreadSafeRpcEndpoint}
 import org.apache.spark.scheduler._
@@ -38,8 +37,7 @@ import org.apache.spark.util._
 private[spark] case class Heartbeat(
     executorId: String,
     accumUpdates: Array[(Long, Seq[AccumulatorV2[_, _]])], // taskId -> accumulator updates
-    blockManagerId: BlockManagerId,
-    executorUpdates: ExecutorMetrics) // executor level updates
+    blockManagerId: BlockManagerId)
 
 /**
  * An event that SparkContext uses to notify HeartbeatReceiver that SparkContext.taskScheduler is
@@ -121,15 +119,17 @@ private[spark] class HeartbeatReceiver(sc: SparkContext, clock: Clock)
       context.reply(true)
 
     // Messages received from executors
-    case heartbeat @ Heartbeat(executorId, accumUpdates, blockManagerId, executorMetrics) =>
+    case heartbeat @ Heartbeat(executorId, accumUpdates, blockManagerId) =>
+      var reregisterBlockManager = !sc.isStopped
       if (scheduler != null) {
         if (executorLastSeen.contains(executorId)) {
           executorLastSeen(executorId) = clock.getTimeMillis()
           eventLoopThread.submit(new Runnable {
             override def run(): Unit = Utils.tryLogNonFatalError {
               val unknownExecutor = !scheduler.executorHeartbeatReceived(
-                executorId, accumUpdates, blockManagerId, executorMetrics)
-              val response = HeartbeatResponse(reregisterBlockManager = unknownExecutor)
+                executorId, accumUpdates, blockManagerId)
+              reregisterBlockManager &= unknownExecutor
+              val response = HeartbeatResponse(reregisterBlockManager)
               context.reply(response)
             }
           })
@@ -139,14 +139,14 @@ private[spark] class HeartbeatReceiver(sc: SparkContext, clock: Clock)
           // not log warning here. Otherwise there may be a lot of noise especially if
           // we explicitly remove executors (SPARK-4134).
           logDebug(s"Received heartbeat from unknown executor $executorId")
-          context.reply(HeartbeatResponse(reregisterBlockManager = true))
+          context.reply(HeartbeatResponse(reregisterBlockManager))
         }
       } else {
         // Because Executor will sleep several seconds before sending the first "Heartbeat", this
         // case rarely happens. However, if it really happens, log it and ask the executor to
         // register itself again.
         logWarning(s"Dropping $heartbeat because TaskScheduler is not ready yet")
-        context.reply(HeartbeatResponse(reregisterBlockManager = true))
+        context.reply(HeartbeatResponse(reregisterBlockManager))
       }
   }
 

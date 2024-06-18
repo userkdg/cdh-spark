@@ -80,7 +80,7 @@ Then, you can supply configuration values at runtime:
 
 The Spark shell and [`spark-submit`](submitting-applications.html)
 tool support two ways to load configurations dynamically. The first is command line options,
-such as `--master`, as shown above. `spark-submit` can accept any Spark property using the `--conf`
+such as `--master`, as shown above. `spark-submit` can accept any Spark property using the `--conf/-c`
 flag, but uses special flags for properties that play a part in launching the Spark application.
 Running `./bin/spark-submit --help` will show the entire list of these options.
 
@@ -190,6 +190,8 @@ of the most common options to set are:
     and it is up to the application to avoid exceeding the overhead memory space
     shared with other non-JVM processes. When PySpark is run in YARN or Kubernetes, this memory
     is added to executor resource requests.
+
+    NOTE: Python memory usage may not be limited on platforms that do not support resource limiting, such as Windows.
   </td>
 </tr>
 <tr>
@@ -264,39 +266,6 @@ of the most common options to set are:
   <td>
     If true, restarts the driver automatically if it fails with a non-zero exit status.
     Only has effect in Spark standalone mode or Mesos cluster deploy mode.
-  </td>
-</tr>
-<tr>
-  <td><code>spark.driver.log.dfsDir</code></td>
-  <td>(none)</td>
-  <td>
-    Base directory in which Spark driver logs are synced, if <code>spark.driver.log.persistToDfs.enabled</code>
-    is true. Within this base directory, each application logs the driver logs to an application specific file.
-    Users may want to set this to a unified location like an HDFS directory so driver log files can be persisted
-    for later usage. This directory should allow any Spark user to read/write files and the Spark History Server
-    user to delete files. Additionally, older logs from this directory are cleaned by the
-    <a href="monitoring.html#spark-history-server-configuration-options">Spark History Server</a> if
-    <code>spark.history.fs.driverlog.cleaner.enabled</code> is true and, if they are older than max age configured
-    by setting <code>spark.history.fs.driverlog.cleaner.maxAge</code>.
-  </td>
-</tr>
-<tr>
-  <td><code>spark.driver.log.persistToDfs.enabled</code></td>
-  <td>false</td>
-  <td>
-    If true, spark application running in client mode will write driver logs to a persistent storage, configured
-    in <code>spark.driver.log.dfsDir</code>. If <code>spark.driver.log.dfsDir</code> is not configured, driver logs
-    will not be persisted. Additionally, enable the cleaner by setting <code>spark.history.fs.driverlog.cleaner.enabled</code>
-    to true in <a href="monitoring.html#spark-history-server-configuration-options">Spark History Server</a>.
-  </td>
-</tr>
-<tr>
-  <td><code>spark.driver.log.layout</code></td>
-  <td>%d{yy/MM/dd HH:mm:ss.SSS} %t %p %c{1}: %m%n</td>
-  <td>
-    The layout for the driver logs that are synced to <code>spark.driver.log.dfsDir</code>. If this is not configured,
-    it uses the layout for the first appender defined in log4j.properties. If that is also not configured, driver logs
-    use the default layout.
   </td>
 </tr>
 </table>
@@ -478,7 +447,7 @@ Apart from these, the following properties are also available, and may be useful
   <td>
     The directory which is used to dump the profile result before driver exiting.
     The results will be dumped as separated file for each RDD. They can be loaded
-    by ptats.Stats(). If this is specified, the profile result will not be displayed
+    by <code>pstats.Stats()</code>. If this is specified, the profile result will not be displayed
     automatically.
   </td>
 </tr>
@@ -561,7 +530,7 @@ Apart from these, the following properties are also available, and may be useful
     option <code>--repositories</code> or <code>spark.jars.repositories</code> will also be included.
     Useful for allowing Spark to resolve artifacts from behind a firewall e.g. via an in-house
     artifact server like Artifactory. Details on the settings file format can be
-    found at http://ant.apache.org/ivy/history/latest-milestone/settings.html
+    found at <a href="http://ant.apache.org/ivy/history/latest-milestone/settings.html">Settings Files</a>
   </td>
 </tr>
  <tr>
@@ -795,17 +764,6 @@ Apart from these, the following properties are also available, and may be useful
   </td>
 </tr>
 <tr>
-  <td><code>spark.eventLog.allowErasureCoding</code></td>
-  <td>false</td>
-  <td>
-    Whether to allow event logs to use erasure coding, or turn erasure coding off, regardless of
-    filesystem defaults.  On HDFS, erasure coded files will not update as quickly as regular
-    replicated files, so the application updates will take longer to appear in the History Server.
-    Note that even if this is true, Spark will still not force the file to use erasure coding, it
-    will simply use filesystem defaults.
-  </td>
-</tr>
-<tr>
   <td><code>spark.eventLog.dir</code></td>
   <td>file:///tmp/spark-events</td>
   <td>
@@ -868,6 +826,14 @@ Apart from these, the following properties are also available, and may be useful
   </td>
 </tr>
 <tr>
+  <td><code>spark.ui.liveUpdate.minFlushPeriod</code></td>
+  <td>1s</td>
+  <td>
+    Minimum time elapsed before stale UI data is flushed. This avoids UI staleness when incoming
+    task events are not fired frequently.
+  </td>
+</tr>
+<tr>
   <td><code>spark.ui.port</code></td>
   <td>4040</td>
   <td>
@@ -894,7 +860,7 @@ Apart from these, the following properties are also available, and may be useful
   <td><code>spark.ui.retainedTasks</code></td>
   <td>100000</td>
   <td>
-    How many tasks the Spark UI and status APIs remember before garbage collecting.
+    How many tasks in one stage the Spark UI and status APIs remember before garbage collecting.
     This is a target maximum, and fewer elements may be retained in some circumstances.
   </td>
 </tr>
@@ -914,11 +880,13 @@ Apart from these, the following properties are also available, and may be useful
 </tr>
 <tr>
   <td><code>spark.ui.showConsoleProgress</code></td>
-  <td>true</td>
+  <td>false</td>
   <td>
     Show the progress bar in the console. The progress bar shows the progress of stages
     that run for longer than 500ms. If multiple stages run at the same time, multiple
     progress bars will be displayed on the same line.
+    <br/>
+    <em>Note:</em> In shell environment, the default value of spark.ui.showConsoleProgress is true.
   </td>
 </tr>
 <tr>
@@ -979,7 +947,7 @@ Apart from these, the following properties are also available, and may be useful
   <td>
     The maximum allowed size for a HTTP request header, in bytes unless otherwise specified.
     This setting applies for the Spark History Server too.
-  <td>
+  </td>
 </tr>
 </table>
 
@@ -994,6 +962,14 @@ Apart from these, the following properties are also available, and may be useful
     Whether to compress broadcast variables before sending them. Generally a good idea.
     Compression will use <code>spark.io.compression.codec</code>.
   </td>
+</tr>
+<tr>
+  <td><code>spark.checkpoint.compress</code></td>
+  <td>false</td>
+  <td>
+    Whether to compress RDD checkpoints. Generally a good idea.
+    Compression will use <code>spark.io.compression.codec</code>.
+   </td>
 </tr>
 <tr>
   <td><code>spark.io.compression.codec</code></td>
@@ -1497,21 +1473,10 @@ Apart from these, the following properties are also available, and may be useful
   <td>120s</td>
   <td>
     Default timeout for all network interactions. This config will be used in place of
-    <code>spark.core.connection.ack.wait.timeout</code>,
     <code>spark.storage.blockManagerSlaveTimeoutMs</code>,
     <code>spark.shuffle.io.connectionTimeout</code>, <code>spark.rpc.askTimeout</code> or
     <code>spark.rpc.lookupTimeout</code> if they are not configured.
   </td>
-</tr>
-<tr>
-  <td><code>spark.network.io.preferDirectBufs</code></td>
-  <td>true</td>
-  <td>
-    If enabled then off-heap buffer allocations are preferred by the shared allocators.
-    Off-heap buffers are used to reduce garbage collection during shuffle and cache
-    block transfer. For environments where off-heap memory is tightly limited, users may wish to
-    turn this off to force all allocations to be on-heap.
-    </td>
 </tr>
 <tr>
   <td><code>spark.port.maxRetries</code></td>
@@ -1551,15 +1516,6 @@ Apart from these, the following properties are also available, and may be useful
   <td>120s</td>
   <td>
     Duration for an RPC remote endpoint lookup operation to wait before timing out.
-  </td>
-</tr>
-<tr>
-  <td><code>spark.core.connection.ack.wait.timeout</code></td>
-  <td><code>spark.network.timeout</code></td>
-  <td>
-    How long for the connection to wait for ack to occur before timing
-    out and giving up. To avoid unwilling timeout caused by long pause like GC,
-    you can set larger value.
   </td>
 </tr>
 </table>

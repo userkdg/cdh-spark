@@ -44,6 +44,7 @@ import org.apache.spark.sql.kafka010.KafkaSourceProvider._
 import org.apache.spark.sql.sources.v2.DataSourceOptions
 import org.apache.spark.sql.sources.v2.reader.streaming.{Offset => OffsetV2}
 import org.apache.spark.sql.streaming.{ProcessingTime, StreamTest}
+import org.apache.spark.sql.streaming.Trigger
 import org.apache.spark.sql.streaming.util.StreamManualClock
 import org.apache.spark.sql.test.SharedSQLContext
 import org.apache.spark.sql.types.StructType
@@ -199,6 +200,41 @@ abstract class KafkaMicroBatchSourceSuiteBase extends KafkaSourceSuiteBase {
       StopStream,
       StartStream(),
       StopStream)
+  }
+
+  test("SPARK-26718 Rate limit set to Long.Max should not overflow integer " +
+    "during end offset calculation") {
+    val topic = newTopic()
+    testUtils.createTopic(topic, partitions = 1)
+    // fill in 5 messages to trigger potential integer overflow
+    testUtils.sendMessages(topic, (0 until 5).map(_.toString).toArray, Some(0))
+
+    val partitionOffsets = Map(
+      new TopicPartition(topic, 0) -> 5L
+    )
+    val startingOffsets = JsonUtils.partitionOffsets(partitionOffsets)
+
+    val kafka = spark
+      .readStream
+      .format("kafka")
+      .option("kafka.bootstrap.servers", testUtils.brokerAddress)
+      // use latest to force begin to be 5
+      .option("startingOffsets", startingOffsets)
+      // use Long.Max to try to trigger overflow
+      .option("maxOffsetsPerTrigger", Long.MaxValue)
+      .option("subscribe", topic)
+      .option("kafka.metadata.max.age.ms", "1")
+      .load()
+      .selectExpr("CAST(key AS STRING)", "CAST(value AS STRING)")
+      .as[(String, String)]
+    val mapped: org.apache.spark.sql.Dataset[_] = kafka.map(kv => kv._2.toInt)
+
+    testStream(mapped)(
+      makeSureGetOffsetCalled,
+      AddKafkaData(Set(topic), 30, 31, 32, 33, 34),
+      CheckAnswer(30, 31, 32, 33, 34),
+      StopStream
+    )
   }
 
   test("maxOffsetsPerTrigger") {
@@ -510,7 +546,7 @@ abstract class KafkaMicroBatchSourceSuiteBase extends KafkaSourceSuiteBase {
     val rows = spark.table("kafkaWatermark").collect()
     assert(rows.length === 1, s"Unexpected results: ${rows.toList}")
     val row = rows(0)
-    // We cannot check the exact window start time as it depands on the time that messages were
+    // We cannot check the exact window start time as it depends on the time that messages were
     // inserted by the producer. So here we just use a low bound to make sure the internal
     // conversion works.
     assert(
@@ -706,7 +742,7 @@ abstract class KafkaMicroBatchSourceSuiteBase extends KafkaSourceSuiteBase {
 
     val topicPartition = new TopicPartition(topic, 0)
     // The message values are the same as their offsets to make the test easy to follow
-    testUtils.withTranscationalProducer { producer =>
+    testUtils.withTransactionalProducer { producer =>
       testStream(mapped)(
         StartStream(ProcessingTime(100), clock),
         waitUntilBatchProcessed,
@@ -829,7 +865,7 @@ abstract class KafkaMicroBatchSourceSuiteBase extends KafkaSourceSuiteBase {
 
     val topicPartition = new TopicPartition(topic, 0)
     // The message values are the same as their offsets to make the test easy to follow
-    testUtils.withTranscationalProducer { producer =>
+    testUtils.withTransactionalProducer { producer =>
       testStream(mapped)(
         StartStream(ProcessingTime(100), clock),
         waitUntilBatchProcessed,
@@ -920,7 +956,7 @@ abstract class KafkaMicroBatchSourceSuiteBase extends KafkaSourceSuiteBase {
       .load()
       .select($"value".as[String])
 
-    testUtils.withTranscationalProducer { producer =>
+    testUtils.withTransactionalProducer { producer =>
       producer.beginTransaction()
       (0 to 3).foreach { i =>
         producer.send(new ProducerRecord[String, String](topic, i.toString)).get()
@@ -936,7 +972,7 @@ abstract class KafkaMicroBatchSourceSuiteBase extends KafkaSourceSuiteBase {
         // this case, if we forget to reset `FetchedData._nextOffsetInFetchedData` or
         // `FetchedData._offsetAfterPoll` (See SPARK-25495), the next batch will see incorrect
         // values and return wrong results hence fail the test.
-        testUtils.withTranscationalProducer { producer =>
+        testUtils.withTransactionalProducer { producer =>
           producer.beginTransaction()
           (4 to 7).foreach { i =>
             producer.send(new ProducerRecord[String, String](topic, i.toString)).get()
@@ -954,6 +990,10 @@ abstract class KafkaMicroBatchSourceSuiteBase extends KafkaSourceSuiteBase {
     } finally {
       q.stop()
     }
+  }
+
+  test("SPARK-27494: read kafka record containing null key/values.") {
+    testNullableKeyValue(Trigger.ProcessingTime(100))
   }
 }
 
@@ -1427,6 +1467,60 @@ abstract class KafkaSourceSuiteBase extends KafkaSourceTest {
       AddKafkaData(Set(topic), 9, 10, 11, 12, 13, 14, 15, 16),
       CheckAnswer(2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17)
     )
+  }
+
+  protected def testNullableKeyValue(trigger: Trigger): Unit = {
+    val table = "kafka_null_key_value_source_test"
+    withTable(table) {
+      val topic = newTopic()
+      testUtils.createTopic(topic)
+      testUtils.withTransactionalProducer { producer =>
+        val df = spark
+          .readStream
+          .format("kafka")
+          .option("kafka.bootstrap.servers", testUtils.brokerAddress)
+          .option("kafka.isolation.level", "read_committed")
+          .option("startingOffsets", "earliest")
+          .option("subscribe", topic)
+          .load()
+          .selectExpr("CAST(key AS STRING)", "CAST(value AS STRING)")
+          .as[(String, String)]
+
+        val q = df
+          .writeStream
+          .format("memory")
+          .queryName(table)
+          .trigger(trigger)
+          .start()
+        try {
+          var idx = 0
+          producer.beginTransaction()
+          val expected1 = Seq.tabulate(5) { _ =>
+            producer.send(new ProducerRecord[String, String](topic, null, null)).get()
+            (null, null)
+          }.asInstanceOf[Seq[(String, String)]]
+
+          val expected2 = Seq.tabulate(5) { _ =>
+            idx += 1
+            producer.send(new ProducerRecord[String, String](topic, idx.toString, null)).get()
+            (idx.toString, null)
+          }.asInstanceOf[Seq[(String, String)]]
+
+          val expected3 = Seq.tabulate(5) { _ =>
+            idx += 1
+            producer.send(new ProducerRecord[String, String](topic, null, idx.toString)).get()
+            (null, idx.toString)
+          }.asInstanceOf[Seq[(String, String)]]
+
+          producer.commitTransaction()
+          eventually(timeout(streamingTimeout)) {
+            checkAnswer(spark.table(table), (expected1 ++ expected2 ++ expected3).toDF())
+          }
+        } finally {
+          q.stop()
+        }
+      }
+    }
   }
 }
 

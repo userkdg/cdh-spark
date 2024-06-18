@@ -89,9 +89,10 @@ trait BinaryArrayExpressionWithImplicitCast extends BinaryExpression
       > SELECT _FUNC_(NULL);
        -1
   """)
-case class Size(child: Expression) extends UnaryExpression with ExpectsInputTypes {
+case class Size(child: Expression, legacySizeOfNull: Boolean)
+  extends UnaryExpression with ExpectsInputTypes {
 
-  val legacySizeOfNull = SQLConf.get.legacySizeOfNull
+  def this(child: Expression) = this(child, SQLConf.get.legacySizeOfNull)
 
   override def dataType: DataType = IntegerType
   override def inputTypes: Seq[AbstractDataType] = Seq(TypeCollection(ArrayType, MapType))
@@ -121,6 +122,10 @@ case class Size(child: Expression) extends UnaryExpression with ExpectsInputType
       defineCodeGen(ctx, ev, c => s"($c).numElements()")
     }
   }
+}
+
+object Size {
+  def apply(child: Expression): Size = new Size(child)
 }
 
 /**
@@ -666,7 +671,7 @@ case class MapFromEntries(child: Expression) extends UnaryExpression {
     val keyArrayData = ctx.freshName("keyArrayData")
     val valueArrayData = ctx.freshName("valueArrayData")
 
-    val baseOffset = Platform.BYTE_ARRAY_OFFSET
+    val baseOffset = "Platform.BYTE_ARRAY_OFFSET"
     val keySize = dataType.keyType.defaultSize
     val valueSize = dataType.valueType.defaultSize
     val kByteSize = s"UnsafeArrayData.calculateSizeOfUnderlyingByteArray($numEntries, $keySize)"
@@ -696,8 +701,8 @@ case class MapFromEntries(child: Expression) extends UnaryExpression {
        |  final byte[] $data = new byte[(int)$byteArraySize];
        |  UnsafeMapData $unsafeMapData = new UnsafeMapData();
        |  Platform.putLong($data, $baseOffset, $keySectionSize);
-       |  Platform.putLong($data, ${baseOffset + 8}, $numEntries);
-       |  Platform.putLong($data, ${baseOffset + 8} + $keySectionSize, $numEntries);
+       |  Platform.putLong($data, $baseOffset + 8, $numEntries);
+       |  Platform.putLong($data, $baseOffset + 8 + $keySectionSize, $numEntries);
        |  $unsafeMapData.pointTo($data, $baseOffset, (int)$byteArraySize);
        |  ArrayData $keyArrayData = $unsafeMapData.keyArray();
        |  ArrayData $valueArrayData = $unsafeMapData.valueArray();
@@ -1471,7 +1476,7 @@ case class ArraysOverlap(left: Expression, right: Expression)
  */
 // scalastyle:off line.size.limit
 @ExpressionDescription(
-  usage = "_FUNC_(x, start, length) - Subsets array x starting from index start (or starting from the end if start is negative) with the specified length.",
+  usage = "_FUNC_(x, start, length) - Subsets array x starting from index start (array indices start at 1, or starting from the end if start is negative) with the specified length.",
   examples = """
     Examples:
       > SELECT _FUNC_(array(1, 2, 3, 4), 2, 2);
@@ -2671,7 +2676,7 @@ object Sequence {
         val maxEstimatedArrayLength =
           getSequenceLength(startMicros, stopMicros, intervalStepInMicros)
 
-        val stepSign = if (stopMicros > startMicros) +1 else -1
+        val stepSign = if (stopMicros >= startMicros) +1 else -1
         val exclusiveItem = stopMicros + stepSign
         val arr = new Array[T](maxEstimatedArrayLength)
         var t = startMicros
@@ -2734,7 +2739,7 @@ object Sequence {
          |
          |  $sequenceLengthCode
          |
-         |  final int $stepSign = $stopMicros > $startMicros ? +1 : -1;
+         |  final int $stepSign = $stopMicros >= $startMicros ? +1 : -1;
          |  final long $exclusiveItem = $stopMicros + $stepSign;
          |
          |  $arr = new $elemType[$arrLength];
@@ -3151,29 +3156,29 @@ case class ArrayDistinct(child: Expression)
     (data: Array[AnyRef]) => new GenericArrayData(data.distinct.asInstanceOf[Array[Any]])
   } else {
     (data: Array[AnyRef]) => {
-      var foundNullElement = false
-      var pos = 0
+      val arrayBuffer = new scala.collection.mutable.ArrayBuffer[AnyRef]
+      var alreadyStoredNull = false
       for (i <- 0 until data.length) {
-        if (data(i) == null) {
-          if (!foundNullElement) {
-            foundNullElement = true
-            pos = pos + 1
+        if (data(i) != null) {
+          var found = false
+          var j = 0
+          while (!found && j < arrayBuffer.size) {
+            val va = arrayBuffer(j)
+            found = (va != null) && ordering.equiv(va, data(i))
+            j += 1
+          }
+          if (!found) {
+            arrayBuffer += data(i)
           }
         } else {
-          var j = 0
-          var done = false
-          while (j <= i && !done) {
-            if (data(j) != null && ordering.equiv(data(j), data(i))) {
-              done = true
-            }
-            j = j + 1
-          }
-          if (i == j - 1) {
-            pos = pos + 1
+          // De-duplicate the null values.
+          if (!alreadyStoredNull) {
+            arrayBuffer += data(i)
+            alreadyStoredNull = true
           }
         }
       }
-      new GenericArrayData(data.slice(0, pos))
+      new GenericArrayData(arrayBuffer)
     }
   }
 

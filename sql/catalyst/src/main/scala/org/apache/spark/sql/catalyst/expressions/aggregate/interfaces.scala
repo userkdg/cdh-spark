@@ -128,12 +128,10 @@ case class AggregateExpression(
   override def nullable: Boolean = aggregateFunction.nullable
 
   override def references: AttributeSet = {
-    val childReferences = mode match {
-      case Partial | Complete => aggregateFunction.references.toSeq
-      case PartialMerge | Final => aggregateFunction.aggBufferAttributes
+    mode match {
+      case Partial | Complete => aggregateFunction.references
+      case PartialMerge | Final => AttributeSet(aggregateFunction.aggBufferAttributes)
     }
-
-    AttributeSet(childReferences)
   }
 
   override def toString: String = {
@@ -184,8 +182,7 @@ abstract class AggregateFunction extends Expression {
   def inputAggBufferAttributes: Seq[AttributeReference]
 
   /**
-   * Result of the aggregate function when the input is empty. This is currently only used for the
-   * proper rewriting of distinct aggregate functions.
+   * Result of the aggregate function when the input is empty.
    */
   def defaultResult: Option[Literal] = None
 

@@ -77,6 +77,7 @@ public class AuthClientBootstrap implements TransportClientBootstrap {
 
     try {
       doSparkAuth(client, channel);
+      client.setClientId(appId);
     } catch (GeneralSecurityException | IOException e) {
       throw Throwables.propagate(e);
     } catch (RuntimeException e) {
@@ -97,15 +98,15 @@ public class AuthClientBootstrap implements TransportClientBootstrap {
 
     String secretKey = secretKeyHolder.getSecretKey(appId);
     try (AuthEngine engine = new AuthEngine(appId, secretKey, conf)) {
-      ClientChallenge challenge = engine.challenge();
+      AuthMessage challenge = engine.challenge();
       ByteBuf challengeData = Unpooled.buffer(challenge.encodedLength());
       challenge.encode(challengeData);
 
       ByteBuffer responseData =
           client.sendRpcSync(challengeData.nioBuffer(), conf.authRTTimeoutMs());
-      ServerResponse response = ServerResponse.decodeMessage(responseData);
+      AuthMessage response = AuthMessage.decodeMessage(responseData);
 
-      engine.validate(response);
+      engine.deriveSessionCipher(challenge, response);
       engine.sessionCipher().addToChannel(channel);
     }
   }

@@ -237,7 +237,7 @@ private[spark] class BlockManager(
       val priorityClass = conf.get(
         "spark.storage.replication.policy", classOf[RandomBlockReplicationPolicy].getName)
       val clazz = Utils.classForName(priorityClass)
-      val ret = clazz.getConstructor().newInstance().asInstanceOf[BlockReplicationPolicy]
+      val ret = clazz.newInstance.asInstanceOf[BlockReplicationPolicy]
       logInfo(s"Using $priorityClass for block replication policy")
       ret
     }
@@ -693,9 +693,9 @@ private[spark] class BlockManager(
    */
   private def getRemoteValues[T: ClassTag](blockId: BlockId): Option[BlockResult] = {
     val ct = implicitly[ClassTag[T]]
-    getRemoteManagedBuffer(blockId).map { data =>
+    getRemoteBytes(blockId).map { data =>
       val values =
-        serializerManager.dataDeserializeStream(blockId, data.createInputStream())(ct)
+        serializerManager.dataDeserializeStream(blockId, data.toInputStream(dispose = true))(ct)
       new BlockResult(values, DataReadMethod.Network, data.size)
     }
   }
@@ -718,9 +718,13 @@ private[spark] class BlockManager(
   }
 
   /**
-   * Get block from remote block managers as a ManagedBuffer.
+   * Get block from remote block managers as serialized bytes.
    */
-  private def getRemoteManagedBuffer(blockId: BlockId): Option[ManagedBuffer] = {
+  def getRemoteBytes(blockId: BlockId): Option[ChunkedByteBuffer] = {
+    // TODO SPARK-25905 if we change this method to return the ManagedBuffer, then getRemoteValues
+    // could just use the inputStream on the temp file, rather than reading the file into memory.
+    // Until then, replication can cause the process to use too much memory and get killed
+    // even though we've read the data to disk.
     logDebug(s"Getting remote block $blockId")
     require(blockId != null, "BlockId is null")
     var runningFailureCount = 0
@@ -785,34 +789,19 @@ private[spark] class BlockManager(
       }
 
       if (data != null) {
-        // If the ManagedBuffer is a BlockManagerManagedBuffer, the disposal of the
-        // byte buffers backing it may need to be handled after reading the bytes.
-        // In this case, since we just fetched the bytes remotely, we do not have
-        // a BlockManagerManagedBuffer. The assert here is to ensure that this holds
-        // true (or the disposal is handled).
-        assert(!data.isInstanceOf[BlockManagerManagedBuffer])
-        return Some(data)
+        // SPARK-24307 undocumented "escape-hatch" in case there are any issues in converting to
+        // ChunkedByteBuffer, to go back to old code-path.  Can be removed post Spark 2.4 if
+        // new path is stable.
+        if (remoteReadNioBufferConversion) {
+          return Some(new ChunkedByteBuffer(data.nioByteBuffer()))
+        } else {
+          return Some(ChunkedByteBuffer.fromManagedBuffer(data))
+        }
       }
       logDebug(s"The value of block $blockId is null")
     }
     logDebug(s"Block $blockId not found")
     None
-  }
-
-  /**
-   * Get block from remote block managers as serialized bytes.
-   */
-  def getRemoteBytes(blockId: BlockId): Option[ChunkedByteBuffer] = {
-    getRemoteManagedBuffer(blockId).map { data =>
-      // SPARK-24307 undocumented "escape-hatch" in case there are any issues in converting to
-      // ChunkedByteBuffer, to go back to old code-path.  Can be removed post Spark 2.4 if
-      // new path is stable.
-      if (remoteReadNioBufferConversion) {
-        new ChunkedByteBuffer(data.nioByteBuffer())
-      } else {
-        ChunkedByteBuffer.fromManagedBuffer(data)
-      }
-    }
   }
 
   /**
@@ -1594,15 +1583,23 @@ private[spark] class BlockManager(
    * lock on the block.
    */
   private def removeBlockInternal(blockId: BlockId, tellMaster: Boolean): Unit = {
+    val blockStatus = if (tellMaster) {
+      val blockInfo = blockInfoManager.assertBlockIsLockedForWriting(blockId)
+      Some(getCurrentBlockStatus(blockId, blockInfo))
+    } else None
+
     // Removals are idempotent in disk store and memory store. At worst, we get a warning.
     val removedFromMemory = memoryStore.remove(blockId)
     val removedFromDisk = diskStore.remove(blockId)
     if (!removedFromMemory && !removedFromDisk) {
       logWarning(s"Block $blockId could not be removed as it was not found on disk or in memory")
     }
+
     blockInfoManager.removeBlock(blockId)
     if (tellMaster) {
-      reportBlockStatus(blockId, BlockStatus.empty)
+      // Only update storage level from the captured block status before deleting, so that
+      // memory size and disk size are being kept for calculating delta.
+      reportBlockStatus(blockId, blockStatus.get.copy(storageLevel = StorageLevel.NONE))
     }
   }
 

@@ -33,12 +33,13 @@ import org.apache.avro.generic.{GenericData, GenericDatumReader, GenericDatumWri
 import org.apache.avro.generic.GenericData.{EnumSymbol, Fixed}
 import org.apache.commons.io.FileUtils
 
-import org.apache.spark.SparkException
+import org.apache.spark.{SPARK_VERSION_SHORT, SparkException}
 import org.apache.spark.sql._
 import org.apache.spark.sql.execution.datasources.DataSource
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.test.{SharedSQLContext, SQLTestUtils}
 import org.apache.spark.sql.types._
+import org.apache.spark.util.Utils
 
 class AvroSuite extends QueryTest with SharedSQLContext with SQLTestUtils {
   import testImplicits._
@@ -266,6 +267,32 @@ class AvroSuite extends QueryTest with SharedSQLContext with SQLTestUtils {
     }
   }
 
+  test("SPARK-27858 Union type: More than one non-null type") {
+    withTempDir { dir =>
+      val complexNullUnionType = Schema.createUnion(
+        List(Schema.create(Type.INT), Schema.create(Type.NULL), Schema.create(Type.STRING)).asJava)
+      val fields = Seq(
+        new Field("field1", complexNullUnionType, "doc", null.asInstanceOf[AnyVal])).asJava
+      val schema = Schema.createRecord("name", "docs", "namespace", false)
+      schema.setFields(fields)
+      val datumWriter = new GenericDatumWriter[GenericRecord](schema)
+      val dataFileWriter = new DataFileWriter[GenericRecord](datumWriter)
+      dataFileWriter.create(schema, new File(s"$dir.avro"))
+      val avroRec = new GenericData.Record(schema)
+      avroRec.put("field1", 42)
+      dataFileWriter.append(avroRec)
+      val avroRec2 = new GenericData.Record(schema)
+      avroRec2.put("field1", "Alice")
+      dataFileWriter.append(avroRec2)
+      dataFileWriter.flush()
+      dataFileWriter.close()
+
+      val df = spark.read.format("avro").load(s"$dir.avro")
+      assert(df.schema === StructType.fromDDL("field1 struct<member0: int, member1: string>"))
+      assert(df.collect().toSet == Set(Row(Row(42, null)), Row(Row(null, "Alice"))))
+    }
+  }
+
   test("Complex Union Type") {
     withTempPath { dir =>
       val fixedSchema = Schema.createFixed("fixed_name", "doc", "namespace", 4)
@@ -339,6 +366,48 @@ class AvroSuite extends QueryTest with SharedSQLContext with SQLTestUtils {
       val df = spark.createDataFrame(rdd, schema)
       df.write.format("avro").save(dir.toString)
       assert(spark.read.format("avro").load(dir.toString).count == rdd.count)
+    }
+  }
+
+  private def createDummyCorruptFile(dir: File): Unit = {
+    Utils.tryWithResource {
+      FileUtils.forceMkdir(dir)
+      val corruptFile = new File(dir, "corrupt.avro")
+      new BufferedWriter(new FileWriter(corruptFile))
+    } { writer =>
+      writer.write("corrupt")
+    }
+  }
+
+  test("Ignore corrupt Avro file if flag IGNORE_CORRUPT_FILES enabled") {
+    withSQLConf(SQLConf.IGNORE_CORRUPT_FILES.key -> "true") {
+      withTempPath { dir =>
+        createDummyCorruptFile(dir)
+        val message = intercept[FileNotFoundException] {
+          spark.read.format("avro").load(dir.getAbsolutePath).schema
+        }.getMessage
+        assert(message.contains("No Avro files found."))
+
+        Files.copy(
+          Paths.get(new URL(episodesAvro).toURI),
+          Paths.get(dir.getCanonicalPath, "episodes.avro"))
+
+        val result = spark.read.format("avro").load(episodesAvro).collect()
+        checkAnswer(spark.read.format("avro").load(dir.getAbsolutePath), result)
+      }
+    }
+  }
+
+  test("Throws IOException on reading corrupt Avro file if flag IGNORE_CORRUPT_FILES disabled") {
+    withSQLConf(SQLConf.IGNORE_CORRUPT_FILES.key -> "false") {
+      withTempPath { dir =>
+        createDummyCorruptFile(dir)
+        val message = intercept[org.apache.spark.SparkException] {
+          spark.read.format("avro").load(dir.getAbsolutePath)
+        }.getMessage
+
+        assert(message.contains("Could not read file"))
+      }
     }
   }
 
@@ -465,7 +534,7 @@ class AvroSuite extends QueryTest with SharedSQLContext with SQLTestUtils {
     val union2 = spark.read.format("avro").load(testAvro).select("union_float_double").collect()
     assert(
       union2
-        .map(x => java.lang.Double.valueOf(x(0).toString))
+        .map(x => new java.lang.Double(x(0).toString))
         .exists(p => Math.abs(p - Math.PI) < 0.001))
 
     val fixed = spark.read.format("avro").load(testAvro).select("fixed3").collect()
@@ -525,6 +594,14 @@ class AvroSuite extends QueryTest with SharedSQLContext with SQLTestUtils {
       val schema = rawSaved.collect().mkString("")
       assert(schema.contains(name))
       assert(schema.contains(namespace))
+    }
+  }
+
+  test("SPARK-34229: Avro should read decimal values with the file schema") {
+    withTempPath { path =>
+      sql("SELECT 3.14 a").write.format("avro").save(path.toString)
+      val data = spark.read.schema("a DECIMAL(4, 3)").format("avro").load(path.toString).collect()
+      assert(data.map(_ (0)).contains(new java.math.BigDecimal("3.140")))
     }
   }
 
@@ -1332,32 +1409,15 @@ class AvroSuite extends QueryTest with SharedSQLContext with SQLTestUtils {
     """.stripMargin)
   }
 
-  test("CDH-73997: CDH 6.0.x backwards compatibility - implicit imports") {
-    import com.databricks.spark.avro._
-    withTempPath { dir =>
-      spark.read.avro(episodesAvro).write.avro(dir.getAbsolutePath())
+  test("SPARK-31327: Write Spark version into Avro file metadata") {
+    withTempPath { path =>
+      spark.range(1).repartition(1).write.format("avro").save(path.getCanonicalPath)
+      val avroFiles = path.listFiles()
+        .filter(f => f.isFile && !f.getName.startsWith(".") && !f.getName.startsWith("_"))
+      assert(avroFiles.length === 1)
+      val reader = DataFileReader.openReader(avroFiles(0), new GenericDatumReader[GenericRecord]())
+      val version = reader.asInstanceOf[DataFileReader[_]].getMetaString(SPARK_VERSION_METADATA_KEY)
+      assert(version === SPARK_VERSION_SHORT)
     }
   }
-
-  test("CDH-73997: CDH 6.0.x backwards compatibility - SchemaConverters") {
-    import com.databricks.spark.avro._
-    withTempDir { dir =>
-      val fields = Seq(new Field("null", Schema.create(Type.NULL), "doc", null))
-      val schema = Schema.createRecord("name", "docs", "namespace", false)
-      schema.setFields(fields.asJava)
-      val datumWriter = new GenericDatumWriter[GenericRecord](schema)
-      val dataFileWriter = new DataFileWriter[GenericRecord](datumWriter)
-      dataFileWriter.create(schema, new File(s"$dir.avro"))
-      val avroRec = new GenericData.Record(schema)
-      avroRec.put("null", null)
-      dataFileWriter.append(avroRec)
-      dataFileWriter.flush()
-      dataFileWriter.close()
-
-      intercept[com.databricks.spark.avro.SchemaConverters.IncompatibleSchemaException] {
-        spark.read.avro(s"$dir.avro")
-      }
-    }
-  }
-
 }

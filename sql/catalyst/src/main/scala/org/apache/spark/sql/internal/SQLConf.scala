@@ -113,7 +113,9 @@ object SQLConf {
    * Returns the active config object within the current scope. If there is an active SparkSession,
    * the proper SQLConf associated with the thread's active session is used. If it's called from
    * tasks in the executor side, a SQLConf will be created from job local properties, which are set
-   * and propagated from the driver side.
+   * and propagated from the driver side, unless a `SQLConf` has been set in the scope by
+   * `withExistingConf` as done for propagating SQLConf for operations performed on RDDs created
+   * from DataFrames.
    *
    * The way this works is a little bit convoluted, due to the fact that config was added initially
    * only for physical plans (and as a result not in sql/catalyst module).
@@ -127,10 +129,16 @@ object SQLConf {
    */
   def get: SQLConf = {
     if (TaskContext.get != null) {
-      new ReadOnlySQLConf(TaskContext.get())
+      val conf = existingConf.get()
+      if (conf != null) {
+        conf
+      } else {
+        new ReadOnlySQLConf(TaskContext.get())
+      }
     } else {
       val isSchedulerEventLoopThread = SparkContext.getActive
-        .map(_.dagScheduler.eventProcessLoop.eventThread)
+        .flatMap { sc => Option(sc.dagScheduler) }
+        .map(_.eventProcessLoop.eventThread)
         .exists(_.getId == Thread.currentThread().getId)
       if (isSchedulerEventLoopThread) {
         // DAGScheduler event loop thread does not have an active SparkSession, the `confGetter`
@@ -300,13 +308,13 @@ object SQLConf {
     .booleanConf
     .createWithDefault(false)
 
-  val FILE_COMRESSION_FACTOR = buildConf("spark.sql.sources.fileCompressionFactor")
+  val FILE_COMPRESSION_FACTOR = buildConf("spark.sql.sources.fileCompressionFactor")
     .internal()
     .doc("When estimating the output data size of a table scan, multiply the file size with this " +
       "factor as the estimated data size, in case the data is compressed in the file and lead to" +
       " a heavily underestimated result.")
     .doubleConf
-    .checkValue(_ > 0, "the value of fileDataSizeFactor must be larger than 0")
+    .checkValue(_ > 0, "the value of fileDataSizeFactor must be greater than 0")
     .createWithDefault(1.0)
 
   val PARQUET_SCHEMA_MERGING_ENABLED = buildConf("spark.sql.parquet.mergeSchema")
@@ -561,12 +569,14 @@ object SQLConf {
     .createWithDefault(HiveCaseSensitiveInferenceMode.INFER_AND_SAVE.toString)
 
   val OPTIMIZER_METADATA_ONLY = buildConf("spark.sql.optimizer.metadataOnly")
+    .internal()
     .doc("When true, enable the metadata-only query optimization that use the table's metadata " +
       "to produce the partition columns instead of table scans. It applies when all the columns " +
       "scanned are partition columns and the query has an aggregate operator that satisfies " +
-      "distinct semantics.")
+      "distinct semantics. By default the optimization is disabled, since it may return " +
+      "incorrect results when the files are empty.")
     .booleanConf
-    .createWithDefault(true)
+    .createWithDefault(false)
 
   val COLUMN_NAME_OF_CORRUPT_RECORD = buildConf("spark.sql.columnNameOfCorruptRecord")
     .doc("The name of internal column for storing raw/un-parsed JSON and CSV records that fail " +
@@ -647,7 +657,7 @@ object SQLConf {
   val BUCKETING_MAX_BUCKETS = buildConf("spark.sql.sources.bucketing.maxBuckets")
     .doc("The maximum number of buckets allowed. Defaults to 100000")
     .intConf
-    .checkValue(_ > 0, "the value of spark.sql.sources.bucketing.maxBuckets must be larger than 0")
+    .checkValue(_ > 0, "the value of spark.sql.sources.bucketing.maxBuckets must be greater than 0")
     .createWithDefault(100000)
 
   val CROSS_JOINS_ENABLED = buildConf("spark.sql.crossJoin.enabled")
@@ -836,6 +846,12 @@ object SQLConf {
   val EXCHANGE_REUSE_ENABLED = buildConf("spark.sql.exchange.reuse")
     .internal()
     .doc("When true, the planner will try to find out duplicated exchanges and re-use them.")
+    .booleanConf
+    .createWithDefault(true)
+
+  val REMOVE_REDUNDANT_SORTS_ENABLED = buildConf("spark.sql.execution.removeRedundantSorts")
+    .internal()
+    .doc("Whether to remove redundant physical sort node")
     .booleanConf
     .createWithDefault(true)
 
@@ -1115,7 +1131,7 @@ object SQLConf {
       .internal()
       .doc("The number of bins when generating histograms.")
       .intConf
-      .checkValue(num => num > 1, "The number of bins must be larger than 1.")
+      .checkValue(num => num > 1, "The number of bins must be greater than 1.")
       .createWithDefault(254)
 
   val PERCENTILE_ACCURACY =
@@ -1285,6 +1301,15 @@ object SQLConf {
         "to use position if not. When false, a grouped map Pandas UDF will assign columns from " +
         "the returned Pandas DataFrame based on position, regardless of column label type. " +
         "This configuration will be deprecated in future releases.")
+      .booleanConf
+      .createWithDefault(true)
+
+  val USE_CONF_ON_RDD_OPERATION =
+    buildConf("spark.sql.legacy.rdd.applyConf")
+      .internal()
+      .doc("When false, SQL configurations are disregarded when operations on a RDD derived from" +
+        " a dataframe are executed. This is the (buggy) behavior up to 2.4.4. This config is " +
+        "deprecated and it will be removed in 3.0.0.")
       .booleanConf
       .createWithDefault(true)
 
@@ -1547,6 +1572,30 @@ object SQLConf {
         "WHERE, which does not follow SQL standard.")
       .booleanConf
       .createWithDefault(false)
+
+  val LEGACY_PASS_PARTITION_BY_AS_OPTIONS =
+    buildConf("spark.sql.legacy.sources.write.passPartitionByAsOptions")
+      .internal()
+      .doc("Whether to pass the partitionBy columns as options in DataFrameWriter. " +
+        "Data source V1 now silently drops partitionBy columns for non-file-format sources; " +
+        "turning the flag on provides a way for these sources to see these partitionBy columns.")
+      .booleanConf
+      .createWithDefault(false)
+
+  val TRUNCATE_TABLE_IGNORE_PERMISSION_ACL =
+    buildConf("spark.sql.truncateTable.ignorePermissionAcl.enabled")
+      .internal()
+      .doc("When set to true, TRUNCATE TABLE command will not try to set back original " +
+        "permission and ACLs when re-creating the table/partition paths.")
+      .booleanConf
+      .createWithDefault(false)
+
+  val LEGACY_MSSQLSERVER_NUMERIC_MAPPING_ENABLED =
+     buildConf("spark.sql.legacy.mssqlserver.numericMapping.enabled")
+       .internal()
+       .doc("When true, use legacy MySqlServer SMALLINT and REAL type mapping.")
+       .booleanConf
+       .createWithDefault(false)
 }
 
 /**
@@ -1716,7 +1765,7 @@ class SQLConf extends Serializable with Logging {
 
   def escapedStringLiterals: Boolean = getConf(ESCAPED_STRING_LITERALS)
 
-  def fileCompressionFactor: Double = getConf(FILE_COMRESSION_FACTOR)
+  def fileCompressionFactor: Double = getConf(FILE_COMPRESSION_FACTOR)
 
   def stringRedactionPattern: Option[Regex] = getConf(SQL_STRING_REDACTION_PATTERN)
 
@@ -1953,6 +2002,12 @@ class SQLConf extends Serializable with Logging {
     getConf(SQLConf.LEGACY_REPLACE_DATABRICKS_SPARK_AVRO_ENABLED)
 
   def setOpsPrecedenceEnforced: Boolean = getConf(SQLConf.LEGACY_SETOPS_PRECEDENCE_ENABLED)
+
+  def truncateTableIgnorePermissionAcl: Boolean =
+    getConf(SQLConf.TRUNCATE_TABLE_IGNORE_PERMISSION_ACL)
+
+  def legacyMsSqlServerNumericMappingEnabled: Boolean =
+    getConf(LEGACY_MSSQLSERVER_NUMERIC_MAPPING_ENABLED)
 
   /** ********************** SQLConf functionality methods ************ */
 

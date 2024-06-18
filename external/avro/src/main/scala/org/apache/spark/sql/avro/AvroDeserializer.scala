@@ -145,16 +145,16 @@ class AvroDeserializer(rootAvroType: Schema, rootCatalystType: DataType) {
         }
         updater.set(ordinal, bytes)
 
-      case (FIXED, d: DecimalType) => (updater, ordinal, value) =>
-        val bigDecimal = decimalConversions.fromFixed(value.asInstanceOf[GenericFixed], avroType,
-          LogicalTypes.decimal(d.precision, d.scale))
-        val decimal = createDecimal(bigDecimal, d.precision, d.scale)
+      case (FIXED, _: DecimalType) => (updater, ordinal, value) =>
+        val d = avroType.getLogicalType.asInstanceOf[LogicalTypes.Decimal]
+        val bigDecimal = decimalConversions.fromFixed(value.asInstanceOf[GenericFixed], avroType, d)
+        val decimal = createDecimal(bigDecimal, d.getPrecision, d.getScale)
         updater.setDecimal(ordinal, decimal)
 
-      case (BYTES, d: DecimalType) => (updater, ordinal, value) =>
-        val bigDecimal = decimalConversions.fromBytes(value.asInstanceOf[ByteBuffer], avroType,
-          LogicalTypes.decimal(d.precision, d.scale))
-        val decimal = createDecimal(bigDecimal, d.precision, d.scale)
+      case (BYTES, _: DecimalType) => (updater, ordinal, value) =>
+        val d = avroType.getLogicalType.asInstanceOf[LogicalTypes.Decimal]
+        val bigDecimal = decimalConversions.fromBytes(value.asInstanceOf[ByteBuffer], avroType, d)
+        val decimal = createDecimal(bigDecimal, d.getPrecision, d.getScale)
         updater.setDecimal(ordinal, decimal)
 
       case (RECORD, st: StructType) =>
@@ -223,6 +223,7 @@ class AvroDeserializer(rootAvroType: Schema, rootCatalystType: DataType) {
       case (UNION, _) =>
         val allTypes = avroType.getTypes.asScala
         val nonNullTypes = allTypes.filter(_.getType != NULL)
+        val nonNullAvroType = Schema.createUnion(nonNullTypes.asJava)
         if (nonNullTypes.nonEmpty) {
           if (nonNullTypes.length == 1) {
             newWriter(nonNullTypes.head, catalystType, path)
@@ -251,7 +252,7 @@ class AvroDeserializer(rootAvroType: Schema, rootCatalystType: DataType) {
                     (updater, ordinal, value) => {
                       val row = new SpecificInternalRow(st)
                       val fieldUpdater = new RowUpdater(row)
-                      val i = GenericData.get().resolveUnion(avroType, value)
+                      val i = GenericData.get().resolveUnion(nonNullAvroType, value)
                       fieldWriters(i)(fieldUpdater, i, value)
                       updater.set(ordinal, row)
                     }

@@ -18,13 +18,10 @@
 package org.apache.spark.deploy
 
 import java.io._
-import java.lang.management.ManagementFactory
-import java.net.URI
+import java.net.{URI, URL}
 import java.nio.charset.StandardCharsets
 import java.nio.file.{Files, Paths}
 
-import scala.collection.JavaConverters._
-import scala.collection.mutable
 import scala.collection.mutable.ArrayBuffer
 import scala.io.Source
 
@@ -46,7 +43,7 @@ import org.apache.spark.internal.Logging
 import org.apache.spark.internal.config._
 import org.apache.spark.launcher.SparkLauncher
 import org.apache.spark.scheduler.EventLoggingListener
-import org.apache.spark.util.{CommandLineUtils, JavaVersion, ResetSystemProperties, Utils}
+import org.apache.spark.util.{CommandLineUtils, ResetSystemProperties, Utils}
 
 trait TestPrematureExit {
   suite: SparkFunSuite =>
@@ -74,27 +71,31 @@ trait TestPrematureExit {
     mainObject.printStream = printStream
 
     @volatile var exitedCleanly = false
+    val original = mainObject.exitFn
     mainObject.exitFn = (_) => exitedCleanly = true
-
-    @volatile var exception: Exception = null
-    val thread = new Thread {
-      override def run() = try {
-        mainObject.main(input)
-      } catch {
-        // Capture the exception to check whether the exception contains searchString or not
-        case e: Exception => exception = e
+    try {
+      @volatile var exception: Exception = null
+      val thread = new Thread {
+        override def run() = try {
+          mainObject.main(input)
+        } catch {
+          // Capture the exception to check whether the exception contains searchString or not
+          case e: Exception => exception = e
+        }
       }
-    }
-    thread.start()
-    thread.join()
-    if (exitedCleanly) {
-      val joined = printStream.lineBuffer.mkString("\n")
-      assert(joined.contains(searchString))
-    } else {
-      assert(exception != null)
-      if (!exception.getMessage.contains(searchString)) {
-        throw exception
+      thread.start()
+      thread.join()
+      if (exitedCleanly) {
+        val joined = printStream.lineBuffer.mkString("\n")
+        assert(joined.contains(searchString))
+      } else {
+        assert(exception != null)
+        if (!exception.getMessage.contains(searchString)) {
+          throw exception
+        }
       }
+    } finally {
+      mainObject.exitFn = original
     }
   }
 }
@@ -476,29 +477,11 @@ class SparkSubmitSuite
     val appArgs1 = new SparkSubmitArguments(clArgs1)
     val (_, _, conf1, _) = submit.prepareSubmitEnvironment(appArgs1)
     conf1.get(UI_SHOW_CONSOLE_PROGRESS) should be (true)
-    var sc1: SparkContext = null
-    try {
-      sc1 = new SparkContext(conf1)
-      assert(sc1.progressBar.isDefined)
-    } finally {
-      if (sc1 != null) {
-        sc1.stop()
-      }
-    }
 
     val clArgs2 = Seq("--class", "org.SomeClass", "thejar.jar")
     val appArgs2 = new SparkSubmitArguments(clArgs2)
     val (_, _, conf2, _) = submit.prepareSubmitEnvironment(appArgs2)
     assert(!conf2.contains(UI_SHOW_CONSOLE_PROGRESS))
-    var sc2: SparkContext = null
-    try {
-      sc2 = new SparkContext(conf2)
-      assert(!sc2.progressBar.isDefined)
-    } finally {
-      if (sc2 != null) {
-        sc2.stop()
-      }
-    }
   }
 
   test("launch simple application with spark-submit") {
@@ -511,53 +494,6 @@ class SparkSubmitSuite
       "--conf", "spark.master.rest.enabled=false",
       unusedJar.toString)
     runSparkSubmit(args)
-  }
-
-  test("Default garbage collector is not added on jdk 8") {
-    if (JavaVersion.isVersionAtLeast(9)) {
-      cancel("jdk 9 and above default gc is set")
-    }
-    val unusedJar = TestUtils.createJarWithClasses(Seq.empty)
-    val args = Seq(
-      "--class", GcPrintTest.getClass.getName.stripSuffix("$"),
-      "--name", "testApp",
-      "--master", "local",
-      "--conf", "spark.ui.enabled=false",
-      "--conf", "spark.master.rest.enabled=false",
-      unusedJar.toString,
-      "")
-    runSparkSubmit(args)
-  }
-
-  test("Default garbage collector is added as java options on jdk 11") {
-    if (!JavaVersion.isVersionAtLeast(9)) {
-      cancel("Below jdk 9 default gc is not touched")
-    }
-    val unusedJar = TestUtils.createJarWithClasses(Seq.empty)
-    val args = Seq(
-      "--class", GcPrintTest.getClass.getName.stripSuffix("$"),
-      "--name", "testApp",
-      "--master", "local",
-      "--conf", "spark.ui.enabled=false",
-      "--conf", "spark.master.rest.enabled=false",
-      unusedJar.toString,
-      "-XX:+UseParallelGC")
-    runSparkSubmit(args)
-  }
-
-  test("User can overwrite default gc with extraJavaOptions") {
-      val unusedJar = TestUtils.createJarWithClasses(Seq.empty)
-      val args = Seq(
-        "--class", GcPrintTest.getClass.getName.stripSuffix("$"),
-        "--name", "testApp",
-        "--master", "local",
-        "--conf", "spark.ui.enabled=false",
-        "--conf", "spark.master.rest.enabled=false",
-        "--conf", "spark.executor.extraJavaOptions=-XX:+UseG1GC",
-        "--conf", "spark.driver.extraJavaOptions=-XX:+UseG1GC",
-        unusedJar.toString,
-        "-XX:+UseG1GC")
-      runSparkSubmit(args)
   }
 
   test("launch simple application with spark-submit with redaction") {
@@ -649,7 +585,7 @@ class SparkSubmitSuite
   }
 
   // TODO(SPARK-9603): Building a package is flaky on Jenkins Maven builds.
-  // See https://gist.github.com/shivaram/3a2fecce60768a603dac for a error log
+  // See https://gist.github.com/shivaram/3a2fecce60768a603dac for an error log
   ignore("correctly builds R packages included in a jar with --packages") {
     assume(RUtils.isRInstalled, "R isn't installed on this machine.")
     assume(RUtils.isSparkRInstalled, "SparkR is not installed in this build.")
@@ -937,6 +873,83 @@ class SparkSubmitSuite
       (Set(archive1.toURI.toString, archive2.toURI.toString))
   }
 
+  test("SPARK-27575: yarn confs should merge new value with existing value") {
+    val tmpJarDir = Utils.createTempDir()
+    val jar1 = TestUtils.createJarWithFiles(Map("test.resource" -> "1"), tmpJarDir)
+    val jar2 = TestUtils.createJarWithFiles(Map("test.resource" -> "USER"), tmpJarDir)
+
+    val tmpJarDirYarnOpt = Utils.createTempDir()
+    val jar1YarnOpt = TestUtils.createJarWithFiles(Map("test.resource" -> "2"), tmpJarDirYarnOpt)
+    val jar2YarnOpt = TestUtils.createJarWithFiles(Map("test.resource" -> "USER2"),
+      tmpJarDirYarnOpt)
+
+    val tmpFileDir = Utils.createTempDir()
+    val file1 = File.createTempFile("tmpFile1", "", tmpFileDir)
+    val file2 = File.createTempFile("tmpFile2", "", tmpFileDir)
+
+    val tmpFileDirYarnOpt = Utils.createTempDir()
+    val file1YarnOpt = File.createTempFile("tmpPy1YarnOpt", ".py", tmpFileDirYarnOpt)
+    val file2YarnOpt = File.createTempFile("tmpPy2YarnOpt", ".egg", tmpFileDirYarnOpt)
+
+    val tmpPyFileDir = Utils.createTempDir()
+    val pyFile1 = File.createTempFile("tmpPy1", ".py", tmpPyFileDir)
+    val pyFile2 = File.createTempFile("tmpPy2", ".egg", tmpPyFileDir)
+
+    val tmpPyFileDirYarnOpt = Utils.createTempDir()
+    val pyFile1YarnOpt = File.createTempFile("tmpPy1YarnOpt", ".py", tmpPyFileDirYarnOpt)
+    val pyFile2YarnOpt = File.createTempFile("tmpPy2YarnOpt", ".egg", tmpPyFileDirYarnOpt)
+
+    val tmpArchiveDir = Utils.createTempDir()
+    val archive1 = File.createTempFile("archive1", ".zip", tmpArchiveDir)
+    val archive2 = File.createTempFile("archive2", ".zip", tmpArchiveDir)
+
+    val tmpArchiveDirYarnOpt = Utils.createTempDir()
+    val archive1YarnOpt = File.createTempFile("archive1YarnOpt", ".zip", tmpArchiveDirYarnOpt)
+    val archive2YarnOpt = File.createTempFile("archive2YarnOpt", ".zip", tmpArchiveDirYarnOpt)
+
+    val tempPyFile = File.createTempFile("tmpApp", ".py")
+    tempPyFile.deleteOnExit()
+
+    val args = Seq(
+      "--class", UserClasspathFirstTest.getClass.getName.stripPrefix("$"),
+      "--name", "testApp",
+      "--master", "yarn",
+      "--deploy-mode", "client",
+      "--jars", s"${tmpJarDir.getAbsolutePath}/*.jar",
+      "--files", s"${tmpFileDir.getAbsolutePath}/tmpFile*",
+      "--py-files", s"${tmpPyFileDir.getAbsolutePath}/tmpPy*",
+      "--archives", s"${tmpArchiveDir.getAbsolutePath}/*.zip",
+      "--conf", "spark.yarn.dist.files=" +
+        s"${Seq(file1YarnOpt, file2YarnOpt).map(_.toURI.toString).mkString(",")}",
+      "--conf", "spark.yarn.dist.pyFiles=" +
+        s"${Seq(pyFile1YarnOpt, pyFile2YarnOpt).map(_.toURI.toString).mkString(",")}",
+      "--conf", "spark.yarn.dist.jars=" +
+        s"${Seq(jar1YarnOpt, jar2YarnOpt).map(_.toURI.toString).mkString(",")}",
+      "--conf", "spark.yarn.dist.archives=" +
+        s"${Seq(archive1YarnOpt, archive2YarnOpt).map(_.toURI.toString).mkString(",")}",
+      tempPyFile.toURI().toString())
+
+    def assertEqualsWithURLs(expected: Set[URL], confValue: String): Unit = {
+      val confValPaths = confValue.split(",").map(new Path(_)).toSet
+      assert(expected.map(u => new Path(u.toURI)) === confValPaths)
+    }
+
+    def assertEqualsWithFiles(expected: Set[File], confValue: String): Unit = {
+      assertEqualsWithURLs(expected.map(_.toURI.toURL), confValue)
+    }
+
+    val appArgs = new SparkSubmitArguments(args)
+    val (_, _, conf, _) = submit.prepareSubmitEnvironment(appArgs)
+    assertEqualsWithURLs(
+      Set(jar1, jar2, jar1YarnOpt, jar2YarnOpt), conf.get("spark.yarn.dist.jars"))
+    assertEqualsWithFiles(
+      Set(file1, file2, file1YarnOpt, file2YarnOpt), conf.get("spark.yarn.dist.files"))
+    assertEqualsWithFiles(
+      Set(pyFile1, pyFile2, pyFile1YarnOpt, pyFile2YarnOpt), conf.get("spark.yarn.dist.pyFiles"))
+    assertEqualsWithFiles(Set(archive1, archive2, archive1YarnOpt, archive2YarnOpt),
+      conf.get("spark.yarn.dist.archives"))
+  }
+
   // scalastyle:on println
 
   private def checkDownloadedFile(sourcePath: String, outputPath: String): Unit = {
@@ -1027,6 +1040,25 @@ class SparkSubmitSuite
       checkDownloadedFile(sourcePath, outputPath)
       deleteTempOutputFile(outputPath)
     }
+  }
+
+  test("remove copies of application jar from classpath") {
+    val fs = File.separator
+    val sparkConf = new SparkConf(false)
+    val hadoopConf = new Configuration()
+    val secMgr = new SecurityManager(sparkConf)
+
+    val appJarName = "myApp.jar"
+    val jar1Name = "myJar1.jar"
+    val jar2Name = "myJar2.jar"
+    val userJar = s"file:/path${fs}to${fs}app${fs}jar$fs$appJarName"
+    val jars = s"file:/$jar1Name,file:/$appJarName,file:/$jar2Name"
+
+    val resolvedJars = DependencyUtils
+      .resolveAndDownloadJars(jars, userJar, sparkConf, hadoopConf, secMgr)
+
+    assert(!resolvedJars.contains(appJarName))
+    assert(resolvedJars.contains(jar1Name) && resolvedJars.contains(jar2Name))
   }
 
   test("Avoid re-upload remote resources in yarn client mode") {
@@ -1342,37 +1374,6 @@ object SimpleApplicationTest {
       }
     }
     sc.stop()
-  }
-}
-
-object GcPrintTest {
-  def main(args: Array[String]) {
-    TestUtils.configTestLog4j("INFO")
-    val conf = new SparkConf()
-    val sc = new SparkContext(conf)
-    val expectedArgs = args(0)
-
-
-    val executorGcs = sc
-      .makeRDD(1 to 5, 2)
-      .flatMap(_ => gcSelectionArgs)
-      .collect()
-    val allGcs = executorGcs ++ gcSelectionArgs
-    val actualGcArgs = allGcs
-      .distinct
-      .sorted
-      .mkString(",")
-    sc.stop()
-    if (expectedArgs != actualGcArgs) {
-      throw new SparkException(
-        s"Expected gc is $expectedArgs actual gcs: $actualGcArgs"
-      )
-    }
-  }
-
-  private def gcSelectionArgs: List[String] = {
-    ManagementFactory.getRuntimeMXBean
-      .getInputArguments.asScala.filter(_.matches(".*Use.*GC.*")).toList
   }
 }
 

@@ -21,6 +21,7 @@ import scala.collection.mutable.ArrayBuffer
 
 import org.apache.spark.sql.catalyst.expressions.SubqueryExpression
 import org.apache.spark.sql.catalyst.plans.logical.{Join, LogicalPlan, Sort}
+import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.test.SharedSQLContext
 
 class SubquerySuite extends QueryTest with SharedSQLContext {
@@ -535,7 +536,7 @@ class SubquerySuite extends QueryTest with SharedSQLContext {
       sql("select a, (select sum(b) from l l2 where l2.a < l1.a) sum_b from l l1")
     }
     assert(msg1.getMessage.contains(
-      "Correlated column is not allowed in a non-equality predicate:"))
+      "Correlated column is not allowed in predicate (l2.`a` < outer(l1.`a`))"))
   }
 
   test("disjunctive correlated scalar subquery") {
@@ -1266,6 +1267,53 @@ class SubquerySuite extends QueryTest with SharedSQLContext {
           |             LIMIT 1)
         """.stripMargin
       assert(getNumSortsInQuery(query5) == 1)
+    }
+  }
+
+  test("SPARK-26078: deduplicate fake self joins for IN subqueries") {
+    withTempView("a", "b") {
+      Seq("a" -> 2, "b" -> 1).toDF("id", "num").createTempView("a")
+      Seq("a" -> 2, "b" -> 1).toDF("id", "num").createTempView("b")
+
+      val df1 = spark.sql(
+        """
+          |SELECT id,num,source FROM (
+          |  SELECT id, num, 'a' as source FROM a
+          |  UNION ALL
+          |  SELECT id, num, 'b' as source FROM b
+          |) AS c WHERE c.id IN (SELECT id FROM b WHERE num = 2)
+        """.stripMargin)
+      checkAnswer(df1, Seq(Row("a", 2, "a"), Row("a", 2, "b")))
+      val df2 = spark.sql(
+        """
+          |SELECT id,num,source FROM (
+          |  SELECT id, num, 'a' as source FROM a
+          |  UNION ALL
+          |  SELECT id, num, 'b' as source FROM b
+          |) AS c WHERE c.id NOT IN (SELECT id FROM b WHERE num = 2)
+        """.stripMargin)
+      checkAnswer(df2, Seq(Row("b", 1, "a"), Row("b", 1, "b")))
+      val df3 = spark.sql(
+        """
+          |SELECT id,num,source FROM (
+          |  SELECT id, num, 'a' as source FROM a
+          |  UNION ALL
+          |  SELECT id, num, 'b' as source FROM b
+          |) AS c WHERE c.id IN (SELECT id FROM b WHERE num = 2) OR
+          |c.id IN (SELECT id FROM b WHERE num = 3)
+        """.stripMargin)
+      checkAnswer(df3, Seq(Row("a", 2, "a"), Row("a", 2, "b")))
+    }
+  }
+
+  test("SPARK-35080: correlated equality predicates contain only outer references") {
+    withTempView("t") {
+      Seq((0, 1), (1, 1)).toDF("c1", "c2").createOrReplaceTempView("t")
+      withSQLConf(SQLConf.CROSS_JOINS_ENABLED.key -> "true") {
+        checkAnswer(
+          sql("select c1, c2, (select count(*) from l where c1 = c2) from t"),
+          Row(0, 1, 0) :: Row(1, 1, 8) :: Nil)
+      }
     }
   }
 }

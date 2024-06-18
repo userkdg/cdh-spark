@@ -25,6 +25,7 @@ import org.apache.spark.sql.{DataFrame, QueryTest, Row}
 import org.apache.spark.sql.catalyst.SchemaPruningTest
 import org.apache.spark.sql.catalyst.parser.CatalystSqlParser
 import org.apache.spark.sql.execution.FileSourceScanExec
+import org.apache.spark.sql.functions._
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.test.SharedSQLContext
 import org.apache.spark.sql.types.StructType
@@ -217,6 +218,41 @@ class ParquetSchemaPruningSuite
       Row("Y.") :: Nil)
   }
 
+  testSchemaPruning("select one complex field and having is null predicate on another " +
+      "complex field") {
+    val query = sql("select * from contacts")
+      .where("name.middle is not null")
+      .select(
+        "id",
+        "name.first",
+        "name.middle",
+        "name.last"
+      )
+      .where("last = 'Jones'")
+      .select(count("id")).toDF()
+    checkScan(query,
+      "struct<id:int,name:struct<middle:string,last:string>>")
+    checkAnswer(query, Row(0) :: Nil)
+  }
+
+  testSchemaPruning("select one deep nested complex field and having is null predicate on " +
+      "another deep nested complex field") {
+    val query = sql("select * from contacts")
+      .where("employer.company.address is not null")
+      .selectExpr(
+        "id",
+        "name.first",
+        "name.middle",
+        "name.last",
+        "employer.id as employer_id"
+      )
+      .where("employer_id = 0")
+      .select(count("id")).toDF()
+    checkScan(query,
+      "struct<id:int,employer:struct<id:int,company:struct<address:string>>>")
+    checkAnswer(query, Row(1) :: Nil)
+  }
+
   private def testSchemaPruning(testName: String)(testThunk: => Unit) {
     test(s"Spark vectorized reader - without partition data column - $testName") {
       withSQLConf(SQLConf.PARQUET_VECTORIZED_READER_ENABLED.key -> "true") {
@@ -378,6 +414,48 @@ class ParquetSchemaPruningSuite
         val expectedScanSchema = CatalystSqlParser.parseDataType(expectedScanSchemaCatalogString)
         implicit val equality = schemaEquality
         assert(scanSchema === expectedScanSchema)
+    }
+  }
+
+  testSchemaPruning("SPARK-34963: extract case-insensitive struct field from array") {
+    withSQLConf(SQLConf.CASE_SENSITIVE.key -> "false") {
+      val query1 = spark.table("contacts")
+        .select("friends.First", "friends.MiDDle")
+      checkScan(query1, "struct<friends:array<struct<first:string,middle:string>>>")
+      checkAnswer(query1,
+        Row(Array.empty[String], Array.empty[String]) ::
+          Row(Array("Susan"), Array("Z.")) ::
+          Row(null, null) ::
+          Row(null, null) :: Nil)
+
+      val query2 = spark.table("contacts")
+        .where("friends.First is not null")
+        .select("friends.First", "friends.MiDDle")
+      checkScan(query2, "struct<friends:array<struct<first:string,middle:string>>>")
+      checkAnswer(query2,
+        Row(Array.empty[String], Array.empty[String]) ::
+          Row(Array("Susan"), Array("Z.")) :: Nil)
+    }
+  }
+
+  testSchemaPruning("SPARK-34963: extract case-insensitive struct field from struct") {
+    withSQLConf(SQLConf.CASE_SENSITIVE.key -> "false") {
+      val query1 = spark.table("contacts")
+        .select("Name.First", "NAME.MiDDle")
+      checkScan(query1, "struct<name:struct<first:string,middle:string>>")
+      checkAnswer(query1,
+        Row("Jane", "X.") ::
+          Row("Janet", null) ::
+          Row("Jim", null) ::
+          Row("John", "Y.") :: Nil)
+
+      val query2 = spark.table("contacts")
+        .where("Name.MIDDLE is not null")
+        .select("Name.First", "NAME.MiDDle")
+      checkScan(query2, "struct<name:struct<first:string,middle:string>>")
+      checkAnswer(query2,
+        Row("Jane", "X.") ::
+          Row("John", "Y.") :: Nil)
     }
   }
 }

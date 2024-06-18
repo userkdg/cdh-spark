@@ -17,6 +17,8 @@
 
 package org.apache.spark.sql.catalyst.analysis
 
+import scala.collection.mutable
+
 import org.apache.spark.api.python.PythonEvalType
 import org.apache.spark.sql.AnalysisException
 import org.apache.spark.sql.catalyst.expressions._
@@ -25,6 +27,7 @@ import org.apache.spark.sql.catalyst.expressions.aggregate.AggregateExpression
 import org.apache.spark.sql.catalyst.optimizer.BooleanSimplification
 import org.apache.spark.sql.catalyst.plans._
 import org.apache.spark.sql.catalyst.plans.logical._
+import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.types._
 
 /**
@@ -273,7 +276,8 @@ trait CheckAnalysis extends PredicateHelper {
             def ordinalNumber(i: Int): String = i match {
               case 0 => "first"
               case 1 => "second"
-              case i => s"${i}th"
+              case 2 => "third"
+              case i => s"${i + 1}th"
             }
             val ref = dataTypes(operator.children.head)
             operator.children.tail.zipWithIndex.foreach { case (child, ti) =>
@@ -298,6 +302,48 @@ trait CheckAnalysis extends PredicateHelper {
                     """.stripMargin.replace("\n", " ").trim())
                 }
               }
+            }
+
+          // If the view output doesn't have the same number of columns neither with the child
+          // output, nor with the query column names, throw an AnalysisException.
+          // If the view's child output can't up cast to the view output,
+          // throw an AnalysisException, too.
+          case v @ View(desc, output, child) if child.resolved && output != child.output =>
+            val queryColumnNames = desc.viewQueryColumnNames
+            val queryOutput = if (queryColumnNames.nonEmpty) {
+              if (output.length != queryColumnNames.length) {
+                // If the view output doesn't have the same number of columns with the query column
+                // names, throw an AnalysisException.
+                throw new AnalysisException(
+                  s"The view output ${output.mkString("[", ",", "]")} doesn't have the same" +
+                    "number of columns with the query column names " +
+                    s"${queryColumnNames.mkString("[", ",", "]")}")
+              }
+              val resolver = SQLConf.get.resolver
+              queryColumnNames.map { colName =>
+                child.output.find { attr =>
+                  resolver(attr.name, colName)
+                }.getOrElse(throw new AnalysisException(
+                  s"Attribute with name '$colName' is not found in " +
+                    s"'${child.output.map(_.name).mkString("(", ",", ")")}'"))
+              }
+            } else {
+              child.output
+            }
+
+            output.zip(queryOutput).foreach {
+              case (attr, originAttr) if !attr.dataType.sameType(originAttr.dataType) =>
+                // The dataType of the output attributes may be not the same with that of the view
+                // output, so we should cast the attribute to the dataType of the view output
+                // attribute. Will throw an AnalysisException if the cast can't be performed or
+                // might truncate.
+                if (Cast.mayTruncate(originAttr.dataType, attr.dataType) ||
+                  !Cast.canCast(originAttr.dataType, attr.dataType)) {
+                  throw new AnalysisException(s"Cannot up cast ${originAttr.sql} from " +
+                    s"${originAttr.dataType.catalogString} to ${attr.dataType.catalogString} " +
+                    "as it may truncate\n")
+                }
+              case _ =>
             }
 
           case _ => // Fallbacks to the following checks
@@ -544,14 +590,72 @@ trait CheckAnalysis extends PredicateHelper {
     // +- SubqueryAlias t1, `t1`
     // +- Project [_1#73 AS c1#76, _2#74 AS c2#77]
     // +- LocalRelation [_1#73, _2#74]
-    def failOnNonEqualCorrelatedPredicate(found: Boolean, p: LogicalPlan): Unit = {
-      if (found) {
+    // SPARK-35080: The same issue can happen to correlated equality predicates when
+    // they do not guarantee one-to-one mapping between inner and outer attributes.
+    // For example:
+    // Table:
+    //   t1(a, b): [(0, 6), (1, 5), (2, 4)]
+    //   t2(c): [(6)]
+    //
+    // Query:
+    //   SELECT c, (SELECT COUNT(*) FROM t1 WHERE a + b = c) FROM t2
+    //
+    // Original subquery plan:
+    //   Aggregate [count(1)]
+    //   +- Filter ((a + b) = outer(c))
+    //      +- LocalRelation [a, b]
+    //
+    // Plan after pulling up correlated predicates:
+    //   Aggregate [a, b] [count(1), a, b]
+    //   +- LocalRelation [a, b]
+    //
+    // Plan after rewrite:
+    //   Project [c1, count(1)]
+    //   +- Join LeftOuter ((a + b) = c)
+    //      :- LocalRelation [c]
+    //      +- Aggregate [a, b] [count(1), a, b]
+    //         +- LocalRelation [a, b]
+    //
+    // The right hand side of the join transformed from the subquery will output
+    //   count(1) | a | b
+    //      1     | 0 | 6
+    //      1     | 1 | 5
+    //      1     | 2 | 4
+    // and the plan after rewrite will give the original query incorrect results.
+    def failOnUnsupportedCorrelatedPredicate(predicates: Seq[Expression], p: LogicalPlan): Unit = {
+      if (predicates.nonEmpty) {
         // Report a non-supported case as an exception
-        failAnalysis(s"Correlated column is not allowed in a non-equality predicate:\n$p")
+        failAnalysis("Correlated column is not allowed in predicate " +
+          s"${predicates.map(_.sql).mkString}:\n$p")
       }
     }
 
-    var foundNonEqualCorrelatedPred: Boolean = false
+    def containsAttribute(e: Expression): Boolean = {
+      e.find(_.isInstanceOf[Attribute]).isDefined
+    }
+
+    // Given a correlated predicate, check if it is either a non-equality predicate or
+    // equality predicate that does not guarantee one-on-one mapping between inner and
+    // outer attributes. When the correlated predicate does not contain any attribute
+    // (i.e. only has outer references), it is supported and should return false. E.G.:
+    //   (a = outer(c)) -> false
+    //   (outer(c) = outer(d)) -> false
+    //   (a > outer(c)) -> true
+    //   (a + b = outer(c)) -> true
+    // The last one is true because there can be multiple combinations of (a, b) that
+    // satisfy the equality condition. For example, if outer(c) = 0, then both (0, 0)
+    // and (-1, 1) can make the predicate evaluate to true.
+    def isUnsupportedPredicate(condition: Expression): Boolean = condition match {
+      // Only allow equality condition with one side being an attribute and another
+      // side being an expression without attributes from the inner query. Note
+      // OuterReference is a leaf node and will not be found here.
+      case Equality(_: Attribute, b) => containsAttribute(b)
+      case Equality(a, _: Attribute) => containsAttribute(a)
+      case e @ Equality(_, _) => containsAttribute(e)
+      case _ => true
+    }
+
+    val unsupportedPredicates = mutable.ArrayBuffer.empty[Expression]
 
     // Simplify the predicates before validating any unsupported correlation patterns in the plan.
     AnalysisHelper.allowInvokingTransformsInAnalyzer { BooleanSimplification(sub).foreachUp {
@@ -594,22 +698,17 @@ trait CheckAnalysis extends PredicateHelper {
       // The other operator is Join. Filter can be anywhere in a correlated subquery.
       case f: Filter =>
         val (correlated, _) = splitConjunctivePredicates(f.condition).partition(containsOuter)
-
-        // Find any non-equality correlated predicates
-        foundNonEqualCorrelatedPred = foundNonEqualCorrelatedPred || correlated.exists {
-          case _: EqualTo | _: EqualNullSafe => false
-          case _ => true
-        }
+        unsupportedPredicates ++= correlated.filter(isUnsupportedPredicate)
         failOnInvalidOuterReference(f)
 
       // Aggregate cannot host any correlated expressions
       // It can be on a correlation path if the correlation contains
-      // only equality correlated predicates.
+      // only supported correlated equality predicates.
       // It cannot be on a correlation path if the correlation has
       // non-equality correlated predicates.
       case a: Aggregate =>
         failOnInvalidOuterReference(a)
-        failOnNonEqualCorrelatedPredicate(foundNonEqualCorrelatedPred, a)
+        failOnUnsupportedCorrelatedPredicate(unsupportedPredicates.toSeq, a)
 
       // Join can host correlated expressions.
       case j @ Join(left, right, joinType, _) =>

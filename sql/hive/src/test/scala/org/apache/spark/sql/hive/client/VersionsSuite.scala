@@ -31,7 +31,7 @@ import org.apache.spark.{SparkConf, SparkFunSuite}
 import org.apache.spark.internal.Logging
 import org.apache.spark.sql.{AnalysisException, Row}
 import org.apache.spark.sql.catalyst.{FunctionIdentifier, TableIdentifier}
-import org.apache.spark.sql.catalyst.analysis.{NoSuchDatabaseException, NoSuchPermanentFunctionException}
+import org.apache.spark.sql.catalyst.analysis.{NoSuchDatabaseException, NoSuchPermanentFunctionException, PartitionsAlreadyExistException}
 import org.apache.spark.sql.catalyst.catalog._
 import org.apache.spark.sql.catalyst.expressions.{AttributeReference, EqualTo, Literal}
 import org.apache.spark.sql.catalyst.util.quietly
@@ -39,7 +39,7 @@ import org.apache.spark.sql.hive.{HiveExternalCatalog, HiveUtils}
 import org.apache.spark.sql.hive.test.TestHiveVersion
 import org.apache.spark.sql.types.IntegerType
 import org.apache.spark.sql.types.StructType
-import org.apache.spark.tags.ExtendedHiveTest
+import org.apache.spark.tags.{ExtendedHiveTest, SlowHiveTest}
 import org.apache.spark.util.{MutableURLClassLoader, Utils}
 
 /**
@@ -49,6 +49,7 @@ import org.apache.spark.util.{MutableURLClassLoader, Utils}
  * is not fully tested.
  */
 // TODO: Refactor this to `HiveClientSuite` and make it a subclass of `HiveVersionSuite`
+@SlowHiveTest
 @ExtendedHiveTest
 class VersionsSuite extends SparkFunSuite with Logging {
 
@@ -504,6 +505,27 @@ class VersionsSuite extends SparkFunSuite with Logging {
       assert(client.getPartitionOption("default", "src_part", spec).isEmpty)
     }
 
+    test(s"$version: createPartitions if already exists") {
+      val partitions = Seq(CatalogTablePartition(
+        Map("key1" -> "101", "key2" -> "102"),
+        storageFormat))
+      try {
+        client.createPartitions("default", "src_part", partitions, ignoreIfExists = false)
+        val errMsg = intercept[PartitionsAlreadyExistException] {
+          client.createPartitions("default", "src_part", partitions, ignoreIfExists = false)
+        }.getMessage
+        assert(errMsg.contains("partitions already exists"))
+      } finally {
+        client.dropPartitions(
+          "default",
+          "src_part",
+          partitions.map(_.spec),
+          ignoreIfNotExists = true,
+          purge = false,
+          retainData = false)
+      }
+    }
+
     ///////////////////////////////////////////////////////////////////////////
     // Function related API
     ///////////////////////////////////////////////////////////////////////////
@@ -615,6 +637,17 @@ class VersionsSuite extends SparkFunSuite with Logging {
       client.runSqlHive("CREATE TABLE indexed_table (key INT)")
       client.runSqlHive("CREATE INDEX index_1 ON TABLE indexed_table(key) " +
         "as 'COMPACT' WITH DEFERRED REBUILD")
+    }
+
+    test(s"$version: sql read hive materialized view") {
+      // HIVE-14249 Since Hive 2.3.0, materialized view is supported.
+      // But skip Hive 3.1 because of SPARK-27074.
+      if (version == "2.3") {
+        client.runSqlHive("CREATE TABLE materialized_view_tbl (c1 INT)")
+        client.runSqlHive("CREATE MATERIALIZED VIEW mv1 AS SELECT * FROM materialized_view_tbl")
+        val e = intercept[AnalysisException](versionSpark.table("mv1").collect()).getMessage
+        assert(e.contains("Hive materialized view is not supported"))
+      }
     }
 
     ///////////////////////////////////////////////////////////////////////////

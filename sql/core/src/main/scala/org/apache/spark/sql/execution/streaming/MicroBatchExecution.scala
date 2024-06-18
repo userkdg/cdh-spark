@@ -291,6 +291,17 @@ class MicroBatchExecution(
               committedOffsets ++= availableOffsets
               watermarkTracker.setWatermark(
                 math.max(watermarkTracker.currentWatermark, commitMetadata.nextBatchWatermarkMs))
+            } else if (latestCommittedBatchId == latestBatchId - 1) {
+              availableOffsets.foreach {
+                case (source: Source, end: Offset) =>
+                  val start = committedOffsets.get(source).map(_.asInstanceOf[Offset])
+                  if (start.map(_ == end).getOrElse(true)) {
+                    source.getBatch(start, end)
+                  }
+                case nonV1Tuple =>
+                  // The V2 API does not have the same edge case requiring getBatch to be called
+                  // here, so we do nothing here.
+              }
             } else if (latestCommittedBatchId < latestBatchId - 1) {
               logWarning(s"Batch completion log latest batch id is " +
                 s"${latestCommittedBatchId}, which is not trailing " +
@@ -489,8 +500,11 @@ class MicroBatchExecution(
     // Rewire the plan to use the new attributes that were returned by the source.
     val newAttributePlan = newBatchesPlan transformAllExpressions {
       case ct: CurrentTimestamp =>
+        // CurrentTimestamp is not TimeZoneAwareExpression while CurrentBatchTimestamp is.
+        // Without TimeZoneId, CurrentBatchTimestamp is unresolved. Here, we use an explicit
+        // dummy string to prevent UnresolvedException and to prevent to be used in the future.
         CurrentBatchTimestamp(offsetSeqMetadata.batchTimestampMs,
-          ct.dataType)
+          ct.dataType, Some("Dummy TimeZoneId"))
       case cd: CurrentDate =>
         CurrentBatchTimestamp(offsetSeqMetadata.batchTimestampMs,
           cd.dataType, cd.timeZoneId)

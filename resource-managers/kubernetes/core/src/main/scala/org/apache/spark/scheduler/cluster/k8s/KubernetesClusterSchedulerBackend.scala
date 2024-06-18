@@ -22,18 +22,16 @@ import scala.concurrent.{ExecutionContext, Future}
 
 import io.fabric8.kubernetes.client.KubernetesClient
 
-import org.apache.spark.SparkContext
 import org.apache.spark.deploy.k8s.Config._
 import org.apache.spark.deploy.k8s.Constants._
-import org.apache.spark.deploy.security.HadoopDelegationTokenManager
-import org.apache.spark.rpc.{RpcAddress, RpcEndpointRef, RpcEnv}
+import org.apache.spark.rpc.{RpcAddress, RpcEnv}
 import org.apache.spark.scheduler.{ExecutorLossReason, TaskSchedulerImpl}
 import org.apache.spark.scheduler.cluster.{CoarseGrainedSchedulerBackend, SchedulerBackendUtils}
 import org.apache.spark.util.{ThreadUtils, Utils}
 
 private[spark] class KubernetesClusterSchedulerBackend(
     scheduler: TaskSchedulerImpl,
-    sc: SparkContext,
+    rpcEnv: RpcEnv,
     kubernetesClient: KubernetesClient,
     requestExecutorsService: ExecutorService,
     snapshotsStore: ExecutorPodsSnapshotsStore,
@@ -41,7 +39,7 @@ private[spark] class KubernetesClusterSchedulerBackend(
     lifecycleEventHandler: ExecutorPodsLifecycleManager,
     watchEvents: ExecutorPodsWatchSnapshotSource,
     pollEvents: ExecutorPodsPollingSnapshotSource)
-    extends CoarseGrainedSchedulerBackend(scheduler, sc.env.rpcEnv) {
+  extends CoarseGrainedSchedulerBackend(scheduler, rpcEnv) {
 
   private implicit val requestExecutorContext =
     ExecutionContext.fromExecutorService(requestExecutorsService)
@@ -54,8 +52,6 @@ private[spark] class KubernetesClusterSchedulerBackend(
     }
 
   private val initialExecutors = SchedulerBackendUtils.getInitialTargetExecutorNumber(conf)
-
-  private val shouldDeleteExecutors = conf.get(KUBERNETES_DELETE_EXECUTORS)
 
   // Allow removeExecutor to be accessible by ExecutorPodsLifecycleEventHandler
   private[k8s] def doRemoveExecutor(executorId: String, reason: ExecutorLossReason): Unit = {
@@ -75,7 +71,9 @@ private[spark] class KubernetesClusterSchedulerBackend(
 
   override def start(): Unit = {
     super.start()
-    podAllocator.setTotalExpectedExecutors(initialExecutors)
+    if (!Utils.isDynamicAllocationEnabled(conf)) {
+      podAllocator.setTotalExpectedExecutors(initialExecutors)
+    }
     lifecycleEventHandler.start(this)
     podAllocator.start(applicationId())
     watchEvents.start(applicationId())
@@ -83,7 +81,11 @@ private[spark] class KubernetesClusterSchedulerBackend(
   }
 
   override def stop(): Unit = {
-    super.stop()
+    // When `CoarseGrainedSchedulerBackend.stop` throws `SparkException`,
+    // K8s cluster scheduler should log and proceed in order to delete the K8s cluster resources.
+    Utils.tryLogNonFatalError {
+      super.stop()
+    }
 
     Utils.tryLogNonFatalError {
       snapshotsStore.stop()
@@ -97,14 +99,12 @@ private[spark] class KubernetesClusterSchedulerBackend(
       pollEvents.stop()
     }
 
-    if (shouldDeleteExecutors) {
-      Utils.tryLogNonFatalError {
-        kubernetesClient
-          .pods()
-          .withLabel(SPARK_APP_ID_LABEL, applicationId())
-          .withLabel(SPARK_ROLE_LABEL, SPARK_POD_EXECUTOR_ROLE)
-          .delete()
-      }
+    Utils.tryLogNonFatalError {
+      kubernetesClient
+        .pods()
+        .withLabel(SPARK_APP_ID_LABEL, applicationId())
+        .withLabel(SPARK_ROLE_LABEL, SPARK_POD_EXECUTOR_ROLE)
+        .delete()
     }
 
     Utils.tryLogNonFatalError {
@@ -141,15 +141,12 @@ private[spark] class KubernetesClusterSchedulerBackend(
     // Don't do anything else - let event handling from the Kubernetes API do the Spark changes
   }
 
-  override def createDriverEndpoint(): DriverEndpoint = {
-    new KubernetesDriverEndpoint()
+  override def createDriverEndpoint(properties: Seq[(String, String)]): DriverEndpoint = {
+    new KubernetesDriverEndpoint(rpcEnv, properties)
   }
 
-  override protected def createTokenManager(): Option[HadoopDelegationTokenManager] = {
-    Some(new HadoopDelegationTokenManager(conf, sc.hadoopConfiguration, driverEndpoint))
-  }
-
-  private class KubernetesDriverEndpoint extends DriverEndpoint {
+  private class KubernetesDriverEndpoint(rpcEnv: RpcEnv, sparkProperties: Seq[(String, String)])
+      extends DriverEndpoint(rpcEnv, sparkProperties) {
 
     override def onDisconnected(rpcAddress: RpcAddress): Unit = {
       // Don't do anything besides disabling the executor - allow the Kubernetes API events to

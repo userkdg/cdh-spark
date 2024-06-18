@@ -28,7 +28,6 @@ import scala.util.Random
 
 import org.apache.spark._
 import org.apache.spark.TaskState.TaskState
-import org.apache.spark.executor.ExecutorMetrics
 import org.apache.spark.internal.Logging
 import org.apache.spark.internal.config
 import org.apache.spark.rpc.RpcEndpoint
@@ -51,6 +50,11 @@ import org.apache.spark.util.{AccumulatorV2, SystemClock, ThreadUtils, Utils}
  * [[SchedulerBackend]]s synchronize on themselves when they want to send events here, and then
  * acquire a lock on us, so we need to make sure that we don't try to lock the backend while
  * we are holding a lock on ourselves.
+
+ * CAUTION: Any non fatal exception thrown within Spark RPC framework can be swallowed.
+ * Thus, throwing exception in methods like resourceOffers, statusUpdate won't fail
+ * the application, but could lead to undefined behavior. Instead, we shall use method like
+ * TaskSetManger.abort() to abort a stage and then fail the application (SPARK-31485).
  */
 private[spark] class TaskSchedulerImpl(
     val sc: SparkContext,
@@ -149,8 +153,6 @@ private[spark] class TaskSchedulerImpl(
 
   private[scheduler] var barrierCoordinator: RpcEndpoint = null
 
-  protected val defaultRackValue: Option[String] = None
-
   private def maybeInitBarrierCoordinator(): Unit = {
     if (barrierCoordinator == null) {
       barrierCoordinator = new BarrierCoordinator(barrierSyncTimeout, sc.listenerBus,
@@ -207,14 +209,20 @@ private[spark] class TaskSchedulerImpl(
       val stage = taskSet.stageId
       val stageTaskSets =
         taskSetsByStageIdAndAttempt.getOrElseUpdate(stage, new HashMap[Int, TaskSetManager])
+
+      // Mark all the existing TaskSetManagers of this stage as zombie, as we are adding a new one.
+      // This is necessary to handle a corner case. Let's say a stage has 10 partitions and has 2
+      // TaskSetManagers: TSM1(zombie) and TSM2(active). TSM1 has a running task for partition 10
+      // and it completes. TSM2 finishes tasks for partition 1-9, and thinks he is still active
+      // because partition 10 is not completed yet. However, DAGScheduler gets task completion
+      // events for all the 10 partitions and thinks the stage is finished. If it's a shuffle stage
+      // and somehow it has missing map outputs, then DAGScheduler will resubmit it and create a
+      // TSM3 for it. As a stage can't have more than one active task set managers, we must mark
+      // TSM2 as zombie (it actually is).
+      stageTaskSets.foreach { case (_, ts) =>
+        ts.isZombie = true
+      }
       stageTaskSets(taskSet.stageAttemptId) = manager
-      val conflictingTaskSet = stageTaskSets.exists { case (_, ts) =>
-        ts.taskSet != taskSet && !ts.isZombie
-      }
-      if (conflictingTaskSet) {
-        throw new IllegalStateException(s"more than one active taskSet for stage $stage:" +
-          s" ${stageTaskSets.toSeq.map{_._2.taskSet.id}.mkString(",")}")
-      }
       schedulableBuilder.addTaskSetManager(manager, manager.taskSet.properties)
 
       if (!isLocal && !hasReceivedTask) {
@@ -367,10 +375,9 @@ private[spark] class TaskSchedulerImpl(
         executorIdToRunningTaskIds(o.executorId) = HashSet[Long]()
         newExecAvail = true
       }
-    }
-    val hosts = offers.map(_.host).toSet.toSeq
-    for ((host, Some(rack)) <- hosts.zip(getRacksForHosts(hosts))) {
-      hostsByRack.getOrElseUpdate(rack, new HashSet[String]()) += host
+      for (rack <- getRackForHost(o.host)) {
+        hostsByRack.getOrElseUpdate(rack, new HashSet[String]()) += o.host
+      }
     }
 
     // Before making any offers, remove any nodes from the blacklist whose blacklist has expired. Do
@@ -389,7 +396,6 @@ private[spark] class TaskSchedulerImpl(
     // Build a list of tasks to assign to each worker.
     val tasks = shuffledOffers.map(o => new ArrayBuffer[TaskDescription](o.cores / CPUS_PER_TASK))
     val availableCpus = shuffledOffers.map(o => o.cores).toArray
-    val availableSlots = shuffledOffers.map(o => o.cores / CPUS_PER_TASK).sum
     val sortedTaskSets = rootPool.getSortedTaskSetQueue
     for (taskSet <- sortedTaskSets) {
       logDebug("parentName: %s, name: %s, runningTasks: %s".format(
@@ -403,6 +409,7 @@ private[spark] class TaskSchedulerImpl(
     // of locality levels so that it gets a chance to launch local tasks on all of them.
     // NOTE: the preferredLocality order: PROCESS_LOCAL, NODE_LOCAL, NO_PREF, RACK_LOCAL, ANY
     for (taskSet <- sortedTaskSets) {
+      val availableSlots = availableCpus.map(c => c / CPUS_PER_TASK).sum
       // Skip the barrier taskSet if the available slots are less than the number of pending tasks.
       if (taskSet.isBarrier && availableSlots < taskSet.numTasks) {
         // Skip the launch process.
@@ -474,11 +481,18 @@ private[spark] class TaskSchedulerImpl(
           // Check whether the barrier tasks are partially launched.
           // TODO SPARK-24818 handle the assert failure case (that can happen when some locality
           // requirements are not fulfilled, and we should revert the launched tasks).
-          require(addressesWithDescs.size == taskSet.numTasks,
-            s"Skip current round of resource offers for barrier stage ${taskSet.stageId} " +
-              s"because only ${addressesWithDescs.size} out of a total number of " +
-              s"${taskSet.numTasks} tasks got resource offers. The resource offers may have " +
-              "been blacklisted or cannot fulfill task locality requirements.")
+          if (addressesWithDescs.size != taskSet.numTasks) {
+            val errorMsg =
+              s"Fail resource offers for barrier stage ${taskSet.stageId} because only " +
+                s"${addressesWithDescs.size} out of a total number of ${taskSet.numTasks}" +
+                s" tasks got resource offers. This happens because barrier execution currently " +
+                s"does not work gracefully with delay scheduling. We highly recommend you to " +
+                s"disable delay scheduling by setting spark.locality.wait=0 as a workaround if " +
+                s"you see this error frequently."
+            logWarning(errorMsg)
+            taskSet.abort(errorMsg)
+            throw new SparkException(errorMsg)
+          }
 
           // materialize the barrier coordinator.
           maybeInitBarrierCoordinator()
@@ -509,7 +523,7 @@ private[spark] class TaskSchedulerImpl(
       taskSet: TaskSetManager,
       taskIndex: Int): TimerTask = {
     new TimerTask() {
-      override def run(): Unit = TaskSchedulerImpl.this.synchronized {
+      override def run() {
         if (unschedulableTaskSetToExpiryTime.contains(taskSet) &&
             unschedulableTaskSetToExpiryTime(taskSet) <= clock.getTimeMillis()) {
           logInfo("Cannot schedule any task because of complete blacklisting. " +
@@ -540,8 +554,12 @@ private[spark] class TaskSchedulerImpl(
             if (state == TaskState.LOST) {
               // TaskState.LOST is only used by the deprecated Mesos fine-grained scheduling mode,
               // where each executor corresponds to a single task, so mark the executor as failed.
-              val execId = taskIdToExecutorId.getOrElse(tid, throw new IllegalStateException(
-                "taskIdToTaskSetManager.contains(tid) <=> taskIdToExecutorId.contains(tid)"))
+              val execId = taskIdToExecutorId.getOrElse(tid, {
+                val errorMsg =
+                  "taskIdToTaskSetManager.contains(tid) <=> taskIdToExecutorId.contains(tid)"
+                taskSet.abort(errorMsg)
+                throw new SparkException(errorMsg)
+              })
               if (executorIdToRunningTaskIds.contains(execId)) {
                 reason = Some(
                   SlaveLost(s"Task $tid was lost, so marking the executor as lost as well."))
@@ -578,15 +596,14 @@ private[spark] class TaskSchedulerImpl(
   }
 
   /**
-   * Update metrics for in-progress tasks and executor metrics, and let the master know that the
-   * BlockManager is still alive. Return true if the driver knows about the given block manager.
-   * Otherwise, return false, indicating that the block manager should re-register.
+   * Update metrics for in-progress tasks and let the master know that the BlockManager is still
+   * alive. Return true if the driver knows about the given block manager. Otherwise, return false,
+   * indicating that the block manager should re-register.
    */
   override def executorHeartbeatReceived(
       execId: String,
       accumUpdates: Array[(Long, Seq[AccumulatorV2[_, _]])],
-      blockManagerId: BlockManagerId,
-      executorMetrics: ExecutorMetrics): Boolean = {
+      blockManagerId: BlockManagerId): Boolean = {
     // (taskId, stageId, stageAttemptId, accumUpdates)
     val accumUpdatesWithTaskIds: Array[(Long, Int, Int, Seq[AccumulableInfo])] = {
       accumUpdates.flatMap { case (id, updates) =>
@@ -596,8 +613,7 @@ private[spark] class TaskSchedulerImpl(
         }
       }
     }
-    dagScheduler.executorHeartbeatReceived(execId, accumUpdatesWithTaskIds, blockManagerId,
-      executorMetrics)
+    dagScheduler.executorHeartbeatReceived(execId, accumUpdatesWithTaskIds, blockManagerId)
   }
 
   def handleTaskGettingResult(taskSetManager: TaskSetManager, tid: Long): Unit = synchronized {
@@ -804,25 +820,8 @@ private[spark] class TaskSchedulerImpl(
     blacklistTrackerOpt.map(_.nodeBlacklist()).getOrElse(scala.collection.immutable.Set())
   }
 
-  /**
-   * Get the rack for one host.
-   *
-   * Note that [[getRacksForHosts]] should be preferred when possible as that can be much
-   * more efficient.
-   */
-  def getRackForHost(host: String): Option[String] = {
-    getRacksForHosts(Seq(host)).head
-  }
-
-  /**
-   * Get racks for multiple hosts.
-   *
-   * The returned Sequence will be the same length as the hosts argument and can be zipped
-   * together with the hosts argument.
-   */
-  def getRacksForHosts(hosts: Seq[String]): Seq[Option[String]] = {
-    hosts.map(_ => defaultRackValue)
-  }
+  // By default, rack is unknown
+  def getRackForHost(value: String): Option[String] = None
 
   private def waitBackendReady(): Unit = {
     if (backend.isReady) {

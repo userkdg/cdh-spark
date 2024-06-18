@@ -27,9 +27,8 @@ import org.json4s.JsonAST._
 import org.json4s.JsonDSL._
 import org.json4s.jackson.JsonMethods._
 
-import org.apache.spark.sql.catalyst.FunctionIdentifier
+import org.apache.spark.sql.catalyst.IdentifierWithDatabase
 import org.apache.spark.sql.catalyst.ScalaReflection._
-import org.apache.spark.sql.catalyst.TableIdentifier
 import org.apache.spark.sql.catalyst.catalog.{BucketSpec, CatalogStorageFormat, CatalogTable, CatalogTableType, FunctionResource}
 import org.apache.spark.sql.catalyst.errors._
 import org.apache.spark.sql.catalyst.expressions._
@@ -211,6 +210,8 @@ abstract class TreeNode[BaseType <: TreeNode[BaseType]] extends Product {
     }
     def mapChild(child: Any): Any = child match {
       case arg: TreeNode[_] if containsChild(arg) => mapTreeNode(arg)
+      // CaseWhen Case or any tuple type
+      case (left, right) => (mapChild(left), mapChild(right))
       case nonChild: AnyRef => nonChild
       case null => null
     }
@@ -226,6 +227,7 @@ abstract class TreeNode[BaseType <: TreeNode[BaseType]] extends Product {
         // `mapValues` is lazy and we need to force it to materialize
         m.mapValues(mapChild).view.force
       case arg: TreeNode[_] if containsChild(arg) => mapTreeNode(arg)
+      case Some(child) => Some(mapChild(child))
       case nonChild: AnyRef => nonChild
       case null => null
     }
@@ -417,11 +419,13 @@ abstract class TreeNode[BaseType <: TreeNode[BaseType]] extends Product {
     }
   }
 
+  private def simpleClassName: String = Utils.getSimpleName(this.getClass)
+
   /**
    * Returns the name of this type of TreeNode.  Defaults to the class name.
    * Note that we remove the "Exec" suffix for physical operators here.
    */
-  def nodeName: String = getClass.getSimpleName.replaceAll("Exec$", "")
+  def nodeName: String = simpleClassName.replaceAll("Exec$", "")
 
   /**
    * The arguments that should be included in the arg string.  Defaults to the `productIterator`.
@@ -608,7 +612,7 @@ abstract class TreeNode[BaseType <: TreeNode[BaseType]] extends Product {
   protected def jsonFields: List[JField] = {
     val fieldNames = getConstructorParameterNames(getClass)
     val fieldValues = productIterator.toSeq ++ otherCopyArgs
-    assert(fieldNames.length == fieldValues.length, s"${getClass.getSimpleName} fields: " +
+    assert(fieldNames.length == fieldValues.length, s"$simpleClassName fields: " +
       fieldNames.mkString(", ") + s", values: " + fieldValues.map(_.toString).mkString(", "))
 
     fieldNames.zip(fieldValues).map {
@@ -675,9 +679,8 @@ abstract class TreeNode[BaseType <: TreeNode[BaseType]] extends Product {
   private def shouldConvertToJson(product: Product): Boolean = product match {
     case exprId: ExprId => true
     case field: StructField => true
-    case id: TableIdentifier => true
+    case id: IdentifierWithDatabase => true
     case join: JoinType => true
-    case id: FunctionIdentifier => true
     case spec: BucketSpec => true
     case catalog: CatalogTable => true
     case partition: Partitioning => true

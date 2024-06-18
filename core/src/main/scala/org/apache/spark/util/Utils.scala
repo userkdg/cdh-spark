@@ -65,7 +65,6 @@ import org.apache.spark.launcher.SparkLauncher
 import org.apache.spark.network.util.JavaUtils
 import org.apache.spark.serializer.{DeserializationStream, SerializationStream, SerializerInstance}
 import org.apache.spark.status.api.v1.{StackTrace, ThreadStackTrace}
-import org.apache.spark.util.io.ChunkedByteBufferOutputStream
 
 /** CallSite represents a place in user code. It can have a short and a long form. */
 private[spark] case class CallSite(shortForm: String, longForm: String)
@@ -90,9 +89,6 @@ private[spark] object Utils extends Logging {
    * base and nearly all files already use Utils.scala
    */
   val DEFAULT_DRIVER_MEM_MB = JavaUtils.DEFAULT_DRIVER_MEM_MB.toInt
-
-  /** Scheme used for files that are locally available on worker nodes in the cluster. */
-  val LOCAL_SCHEME = "local"
 
   private val MAX_DIR_CREATION_ATTEMPTS: Int = 10
   @volatile private var localRootDirs: Array[String] = null
@@ -378,50 +374,6 @@ private[spark] object Utils extends Logging {
           out.close()
         }
       }
-    }
-  }
-
-  /**
-   * Copy the first `maxSize` bytes of data from the InputStream to an in-memory
-   * buffer, primarily to check for corruption.
-   *
-   * This returns a new InputStream which contains the same data as the original input stream.
-   * It may be entirely on in-memory buffer, or it may be a combination of in-memory data, and then
-   * continue to read from the original stream. The only real use of this is if the original input
-   * stream will potentially detect corruption while the data is being read (eg. from compression).
-   * This allows for an eager check of corruption in the first maxSize bytes of data.
-   *
-   * @return An InputStream which includes all data from the original stream (combining buffered
-   *         data and remaining data in the original stream)
-   */
-  def copyStreamUpTo(in: InputStream, maxSize: Long): InputStream = {
-    var count = 0L
-    val out = new ChunkedByteBufferOutputStream(64 * 1024, ByteBuffer.allocate)
-    val fullyCopied = tryWithSafeFinally {
-      val bufSize = Math.min(8192L, maxSize)
-      val buf = new Array[Byte](bufSize.toInt)
-      var n = 0
-      while (n != -1 && count < maxSize) {
-        n = in.read(buf, 0, Math.min(maxSize - count, bufSize).toInt)
-        if (n != -1) {
-          out.write(buf, 0, n)
-          count += n
-        }
-      }
-      count < maxSize
-    } {
-      try {
-        if (count < maxSize) {
-          in.close()
-        }
-      } finally {
-        out.close()
-      }
-    }
-    if (fullyCopied) {
-      out.toChunkedByteBuffer.toInputStream(dispose = true)
-    } else {
-      new SequenceInputStream( out.toChunkedByteBuffer.toInputStream(dispose = true), in)
     }
   }
 
@@ -1133,7 +1085,7 @@ private[spark] object Utils extends Logging {
   }
 
   /**
-   * Convert a time parameter such as (50s, 100ms, or 250us) to microseconds for internal use. If
+   * Convert a time parameter such as (50s, 100ms, or 250us) to milliseconds for internal use. If
    * no suffix is provided, the passed number is assumed to be in ms.
    */
   def timeStringAsMs(str: String): Long = {
@@ -2376,10 +2328,7 @@ private[spark] object Utils extends Logging {
    * configure a new log4j level
    */
   def setLogLevel(l: org.apache.log4j.Level) {
-    val rootLogger = org.apache.log4j.Logger.getRootLogger()
-    rootLogger.setLevel(l)
-    // Setting threshold to null as rootLevel will define log level for spark-shell
-    Logging.sparkShellThresholdLevel = null
+    org.apache.log4j.Logger.getRootLogger().setLevel(l)
   }
 
   /**
@@ -2481,8 +2430,7 @@ private[spark] object Utils extends Logging {
       "org.apache.spark.security.ShellBasedGroupsMappingProvider")
     if (groupProviderClassName != "") {
       try {
-        val groupMappingServiceProvider = classForName(groupProviderClassName).
-          getConstructor().newInstance().
+        val groupMappingServiceProvider = classForName(groupProviderClassName).newInstance.
           asInstanceOf[org.apache.spark.security.GroupMappingServiceProvider]
         val currentUserGroups = groupMappingServiceProvider.getGroups(username)
         return currentUserGroups
@@ -2788,19 +2736,16 @@ private[spark] object Utils extends Logging {
     }
 
     val masterScheme = new URI(masterWithoutK8sPrefix).getScheme
-    val resolvedURL = masterScheme.toLowerCase match {
-      case "https" =>
+
+    val resolvedURL = Option(masterScheme).map(_.toLowerCase(Locale.ROOT)) match {
+      case Some("https") =>
         masterWithoutK8sPrefix
-      case "http" =>
+      case Some("http") =>
         logWarning("Kubernetes master URL uses HTTP instead of HTTPS.")
         masterWithoutK8sPrefix
-      case null =>
-        val resolvedURL = s"https://$masterWithoutK8sPrefix"
-        logInfo("No scheme specified for kubernetes master URL, so defaulting to https. Resolved " +
-          s"URL is $resolvedURL.")
-        resolvedURL
       case _ =>
-        throw new IllegalArgumentException("Invalid Kubernetes master scheme: " + masterScheme)
+        throw new IllegalArgumentException("Invalid Kubernetes master scheme: " + masterScheme
+          + " found in URL: " + masterWithoutK8sPrefix)
     }
 
     s"k8s://$resolvedURL"
@@ -2830,18 +2775,42 @@ private[spark] object Utils extends Logging {
   }
 
   /**
+   * Returns true if and only if the underlying class is a member class.
+   *
+   * Note: jdk8u throws a "Malformed class name" error if a given class is a deeply-nested
+   * inner class (See SPARK-34607 for details). This issue has already been fixed in jdk9+, so
+   * we can remove this helper method safely if we drop the support of jdk8u.
+   */
+  def isMemberClass(cls: Class[_]): Boolean = {
+    try {
+      cls.isMemberClass
+    } catch {
+      case _: InternalError =>
+        // We emulate jdk8u `Class.isMemberClass` below:
+        //   public boolean isMemberClass() {
+        //     return getSimpleBinaryName() != null && !isLocalOrAnonymousClass();
+        //   }
+        // `getSimpleBinaryName()` returns null if a given class is a top-level class,
+        // so we replace it with `cls.getEnclosingClass != null`. The second condition checks
+        // if a given class is not a local or an anonymous class, so we replace it with
+        // `cls.getEnclosingMethod == null` because `cls.getEnclosingMethod()` return a value
+        // only in either case (JVM Spec 4.8.6).
+        //
+        // Note: The newer jdk evaluates `!isLocalOrAnonymousClass()` first,
+        // we reorder the conditions to follow it.
+        cls.getEnclosingMethod == null && cls.getEnclosingClass != null
+    }
+  }
+
+  /**
    * Safer than Class obj's getSimpleName which may throw Malformed class name error in scala.
-   * This method mimics scalatest's getSimpleNameOfAnObjectsClass.
+   * This method mimicks scalatest's getSimpleNameOfAnObjectsClass.
    */
   def getSimpleName(cls: Class[_]): String = {
     try {
-      cls.getSimpleName
+      return cls.getSimpleName
     } catch {
-      // TODO: the value returned here isn't even quite right; it returns simple names
-      // like UtilsSuite$MalformedClassObject$MalformedClass instead of MalformedClass
-      // The exact value may not matter much as it's used in log statements
-      case _: InternalError =>
-        stripDollars(stripPackages(cls.getName))
+      case err: InternalError => return stripDollars(stripPackages(cls.getName))
     }
   }
 
@@ -2920,17 +2889,11 @@ private[spark] object Utils extends Logging {
     if (str == null) 0 else str.length + fullWidthRegex.findAllIn(str).size
   }
 
-  def sanitizeDirName(str: String): String = {
-    str.replaceAll("[ :/]", "-").replaceAll("[.${}'\"]", "_").toLowerCase(Locale.ROOT)
-  }
-
-  def isClientMode(conf: SparkConf): Boolean = {
-    "client".equals(conf.get(SparkLauncher.DEPLOY_MODE, "client"))
-  }
-
-  /** Returns whether the URI is a "local:" URI. */
-  def isLocalUri(uri: String): Boolean = {
-    uri.startsWith(s"$LOCAL_SCHEME:")
+  /** Create a new properties object with the same values as `props` */
+  def cloneProperties(props: Properties): Properties = {
+    val resultProps = new Properties()
+    props.asScala.foreach(entry => resultProps.put(entry._1, entry._2))
+    resultProps
   }
 }
 

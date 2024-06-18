@@ -132,8 +132,10 @@ class HadoopTableReader(
 
     val deserializedHadoopRDD = hadoopRDD.mapPartitions { iter =>
       val hconf = broadcastedHadoopConf.value.value
-      val deserializer = deserializerClass.getConstructor().newInstance()
-      deserializer.initialize(hconf, localTableDesc.getProperties)
+      val deserializer = deserializerClass.newInstance()
+      DeserializerLock.synchronized {
+        deserializer.initialize(hconf, localTableDesc.getProperties)
+      }
       HadoopTableReader.fillObject(iter, deserializer, attrsWithIndex, mutableRow, deserializer)
     }
 
@@ -245,7 +247,7 @@ class HadoopTableReader(
       val localTableDesc = tableDesc
       createHadoopRdd(localTableDesc, inputPathStr, ifc).mapPartitions { iter =>
         val hconf = broadcastedHiveConf.value.value
-        val deserializer = localDeserializer.getConstructor().newInstance()
+        val deserializer = localDeserializer.newInstance()
         // SPARK-13709: For SerDes like AvroSerDe, some essential information (e.g. Avro schema
         // information) may be defined in table properties. Here we should merge table properties
         // and partition properties before initializing the deserializer. Note that partition
@@ -255,10 +257,14 @@ class HadoopTableReader(
         partProps.asScala.foreach {
           case (key, value) => props.setProperty(key, value)
         }
-        deserializer.initialize(hconf, props)
+        DeserializerLock.synchronized {
+          deserializer.initialize(hconf, props)
+        }
         // get the table deserializer
-        val tableSerDe = localTableDesc.getDeserializerClass.getConstructor().newInstance()
-        tableSerDe.initialize(hconf, localTableDesc.getProperties)
+        val tableSerDe = localTableDesc.getDeserializerClass.newInstance()
+        DeserializerLock.synchronized {
+          tableSerDe.initialize(hconf, localTableDesc.getProperties)
+        }
 
         // fill the non partition key attributes
         HadoopTableReader.fillObject(iter, deserializer, nonPartitionKeyAttrs,
@@ -336,6 +342,17 @@ private[hive] object HiveTableUtil {
     }
   }
 }
+
+/**
+ * Object to synchronize on when calling org.apache.hadoop.hive.serde2.Deserializer#initialize.
+ *
+ * [SPARK-17398] org.apache.hive.hcatalog.data.JsonSerDe#initialize calls the non-thread-safe
+ * HCatRecordObjectInspectorFactory.getHCatRecordObjectInspector, the results of which are
+ * returned by JsonSerDe#getObjectInspector.
+ * To protect against this bug in Hive (HIVE-15773/HIVE-21752), we synchronize on this object
+ * when calling initialize on Deserializer instances that could be JsonSerDe instances.
+ */
+private[hive] object DeserializerLock
 
 private[hive] object HadoopTableReader extends HiveInspectors with Logging {
   /**

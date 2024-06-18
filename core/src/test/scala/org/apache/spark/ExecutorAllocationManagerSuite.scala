@@ -19,20 +19,17 @@ package org.apache.spark
 
 import scala.collection.mutable
 
-import org.mockito.ArgumentMatchers.{any, eq => meq}
+import org.mockito.Matchers.{any, eq => meq}
 import org.mockito.Mockito.{mock, never, verify, when}
-import org.mockito.invocation.InvocationOnMock
-import org.mockito.stubbing.Answer
-import org.scalatest.{BeforeAndAfter, PrivateMethodTester}
+import org.scalatest.PrivateMethodTester
 
 import org.apache.spark.executor.TaskMetrics
 import org.apache.spark.internal.config
-import org.apache.spark.metrics.MetricsSystem
 import org.apache.spark.scheduler._
 import org.apache.spark.scheduler.ExternalClusterManager
 import org.apache.spark.scheduler.cluster.ExecutorInfo
 import org.apache.spark.scheduler.local.LocalSchedulerBackend
-import org.apache.spark.storage._
+import org.apache.spark.storage.BlockManagerMaster
 import org.apache.spark.util.ManualClock
 
 /**
@@ -40,20 +37,24 @@ import org.apache.spark.util.ManualClock
  */
 class ExecutorAllocationManagerSuite
   extends SparkFunSuite
-  with LocalSparkContext
-  with BeforeAndAfter {
+  with LocalSparkContext {
 
   import ExecutorAllocationManager._
   import ExecutorAllocationManagerSuite._
 
   private val contexts = new mutable.ListBuffer[SparkContext]()
 
-  before {
+  override def beforeEach(): Unit = {
+    super.beforeEach()
     contexts.clear()
   }
 
-  after {
-    contexts.foreach(_.stop())
+  override def afterEach(): Unit = {
+    try {
+      contexts.foreach(_.stop())
+    } finally {
+      super.afterEach()
+    }
   }
 
   private def post(bus: LiveListenerBus, event: SparkListenerEvent): Unit = {
@@ -284,7 +285,7 @@ class ExecutorAllocationManagerSuite
     assert(totalRunningTasks(manager) === 0)
   }
 
-  test("cancel pending executors when no longer needed") {
+  testRetry("cancel pending executors when no longer needed") {
     sc = createSparkContext(0, 10, 0)
     val manager = sc.executorAllocationManager.get
     post(sc.listenerBus, SparkListenerStageSubmitted(createStageInfo(2, 5)))
@@ -423,6 +424,7 @@ class ExecutorAllocationManagerSuite
     // Remove when numExecutorsTarget is the same as the current number of executors
     assert(addExecutors(manager) === 1)
     assert(addExecutors(manager) === 2)
+    (1 to 8).foreach(execId => onExecutorAdded(manager, execId.toString))
     (1 to 8).map { i => createTaskInfo(i, i, s"$i") }.foreach {
       info => post(sc.listenerBus, SparkListenerTaskStart(0, 0, info)) }
     assert(executorIds(manager).size === 8)
@@ -836,7 +838,7 @@ class ExecutorAllocationManagerSuite
     assert(removeTimes(manager).size === 1)
   }
 
-  test("SPARK-4951: call onTaskStart before onBlockManagerAdded") {
+  test("SPARK-4951: call onTaskStart before onExecutorAdded") {
     sc = createSparkContext(2, 10, 2)
     val manager = sc.executorAllocationManager.get
     assert(executorIds(manager).isEmpty)
@@ -938,12 +940,7 @@ class ExecutorAllocationManagerSuite
 
     assert(maxNumExecutorsNeeded(manager) === 0)
     schedule(manager)
-    // Verify executor is timeout but numExecutorsTarget is not recalculated
-    assert(numExecutorsTarget(manager) === 3)
-
-    // Schedule again to recalculate the numExecutorsTarget after executor is timeout
-    schedule(manager)
-    // Verify that current number of executors should be ramp down when executor is timeout
+    // Verify executor is timeout,numExecutorsTarget is recalculated
     assert(numExecutorsTarget(manager) === 2)
   }
 
@@ -1106,7 +1103,7 @@ class ExecutorAllocationManagerSuite
     val mockAllocationClient = mock(classOf[ExecutorAllocationClient])
     val mockBMM = mock(classOf[BlockManagerMaster])
     val manager = new ExecutorAllocationManager(
-      mockAllocationClient, mock(classOf[LiveListenerBus]), conf, mockBMM, null)
+      mockAllocationClient, mock(classOf[LiveListenerBus]), conf, mockBMM)
     val clock = new ManualClock()
     manager.setClock(clock)
 
@@ -1150,162 +1147,46 @@ class ExecutorAllocationManagerSuite
     verify(mockAllocationClient).killExecutors(Seq("executor-1"), false, false, false)
   }
 
-  test("CDH-77502: executor block tracker") {
-    val conf = new SparkConf(false)
-      .set("spark.dynamicAllocation.enabled", "true")
-      .set(config.SHUFFLE_SERVICE_ENABLED, false)
-      .set(config.Cloudera.DYN_ALLOCATION_FORCE_ENABLE, true)
-      .set("spark.dynamicAllocation.executorIdleTimeout", "3s")
-      .set("spark.dynamicAllocation.cachedExecutorIdleTimeout", "5s")
-      .set(config.Cloudera.DYN_ALLOCATION_SHUFFLE_TIMEOUT, 10L)
-    val manager = new ExecutorAllocationManager(
-      mock(classOf[ExecutorAllocationClient]),
-      mock(classOf[LiveListenerBus]),
-      conf,
-      mock(classOf[BlockManagerMaster]),
-      null)
-
-    val tracker = new manager.ExecutorTracker()
-    assert(!tracker.isTimedOut(1000))
-
-    tracker.idleStart = 0L
-    assert(!tracker.isTimedOut(1000))
-    assert(tracker.isTimedOut(4000))
-
-    tracker.cachedBlocks = 1
-    assert(!tracker.isTimedOut(4000))
-    assert(tracker.isTimedOut(6000))
-
-    tracker.shuffleBlocks = 1
-    assert(!tracker.isTimedOut(6000))
-    assert(tracker.isTimedOut(11000))
+  test("SPARK-26758 check executor target number after idle time out ") {
+    sc = createSparkContext(1, 5, 3)
+    val manager = sc.executorAllocationManager.get
+    val clock = new ManualClock(10000L)
+    manager.setClock(clock)
+    assert(numExecutorsTarget(manager) === 3)
+    manager.listener.onExecutorAdded(SparkListenerExecutorAdded(
+      clock.getTimeMillis(), "executor-1", new ExecutorInfo("host1", 1, Map.empty)))
+    manager.listener.onExecutorAdded(SparkListenerExecutorAdded(
+      clock.getTimeMillis(), "executor-2", new ExecutorInfo("host1", 2, Map.empty)))
+    manager.listener.onExecutorAdded(SparkListenerExecutorAdded(
+      clock.getTimeMillis(), "executor-3", new ExecutorInfo("host1", 3, Map.empty)))
+    // make all the executors as idle, so that it will be killed
+    clock.advance(executorIdleTimeout * 1000)
+    schedule(manager)
+    // once the schedule is run target executor number should be 1
+    assert(numExecutorsTarget(manager) === 1)
   }
 
-  test("CDH-77502: track executor storage to decide when to time out") {
-    val conf = new SparkConf(false)
-      .set("spark.dynamicAllocation.enabled", "true")
-      .set("spark.dynamicAllocation.testing", "true")
-      .set(config.SHUFFLE_SERVICE_ENABLED, false)
-      .set(config.Cloudera.DYN_ALLOCATION_FORCE_ENABLE, true)
-      .set("spark.dynamicAllocation.executorIdleTimeout", "1s")
-      .set("spark.dynamicAllocation.cachedExecutorIdleTimeout", "2s")
-      .set(config.Cloudera.DYN_ALLOCATION_SHUFFLE_TIMEOUT, 5L)
-      // Disable the automatic task to figure things out. The test drives the manager manually.
-      .set(TESTING_SCHEDULE_INTERVAL_KEY, Long.MaxValue.toString)
-    val bus = new LiveListenerBus(conf)
-    val clock = new ManualClock()
+  test("SPARK-26927 call onExecutorRemoved before onTaskStart") {
+    sc = createSparkContext(2, 5)
+    val manager = sc.executorAllocationManager.get
+    assert(executorIds(manager).isEmpty)
+    post(sc.listenerBus, SparkListenerExecutorAdded(
+      0L, "1", new ExecutorInfo("host1", 1, Map.empty)))
+    post(sc.listenerBus, SparkListenerExecutorAdded(
+      0L, "2", new ExecutorInfo("host2", 1, Map.empty)))
+    post(sc.listenerBus, SparkListenerExecutorAdded(
+      0L, "3", new ExecutorInfo("host3", 1, Map.empty)))
+    assert(executorIds(manager).size === 3)
 
-    var mapOutputListener: MapOutputTrackerListener = null
-    val mapOutputTracker = mock(classOf[MapOutputTrackerMaster])
-    when(mapOutputTracker.addListener(any())).thenAnswer(
-      new Answer[Unit] {
-        override def answer(invocation: InvocationOnMock): Unit = {
-          mapOutputListener = invocation.getArguments()(0).asInstanceOf[MapOutputTrackerListener]
-        }
-      }
-    )
+    post(sc.listenerBus, SparkListenerExecutorRemoved(0L, "3", "disconnected"))
+    assert(executorIds(manager).size === 2)
+    assert(executorIds(manager) === Set("1", "2"))
 
-    val manager = new ExecutorAllocationManager(mock(classOf[ExecutorAllocationClient]), bus, conf,
-      mock(classOf[BlockManagerMaster]), mapOutputTracker)
-    manager.setClock(clock)
-
-    bus.start(mock(classOf[SparkContext]), mock(classOf[MetricsSystem]))
-    try {
-      manager.start()
-      assert(mapOutputListener !== null)
-
-      def advanceAndVerify(ms: Long, expectedPending: Set[String]): Unit = {
-        clock.advance(ms)
-        schedule(manager)
-        assert(executorsPendingToRemove(manager) === expectedPending)
-        expectedPending.foreach(onExecutorRemoved(manager, _))
-      }
-
-      def postExecutorStart(execId: String): Unit = {
-        post(bus, SparkListenerExecutorAdded(clock.getTimeMillis(), execId,
-          new ExecutorInfo(s"$execId.example.com", 1, Map())))
-      }
-
-      def postBlockUpdate(execId: String, blockId: String, level: StorageLevel): Unit = {
-        val bm = blockManagerId(execId)
-        val blockInfo = BlockUpdatedInfo(bm, BlockId(blockId), level, 1L, 1L)
-        val update = SparkListenerBlockUpdated(blockInfo)
-        post(bus, update)
-      }
-
-      def mapStatus(execId: String): MapStatus = {
-        new CompressedMapStatus(blockManagerId(execId), Array[Byte]())
-      }
-
-      def blockManagerId(execId: String): BlockManagerId = {
-        BlockManagerId(execId, s"$execId.example.com", 42)
-      }
-
-      //////////////////////////////
-      // Basic executor idle check, without any block storage.
-      postExecutorStart("1")
-      // post task started
-      post(bus, SparkListenerStageSubmitted(createStageInfo(1, 1)))
-      val taskInfo = createTaskInfo(0, 0, "1")
-      post(bus, SparkListenerTaskStart(1, 0, taskInfo))
-      // advance clock past idle timeout, check executor still there.
-      advanceAndVerify(1500, Set())
-      // post task end
-      post(bus, SparkListenerTaskEnd(0, 0, null, Success, taskInfo, null))
-      // advance clock and check timeout.
-      advanceAndVerify(500, Set())
-      advanceAndVerify(1000, Set("1"))
-
-      //////////////////////////////
-      // Executor idle check with cached block; check that a different timeout is applied when
-      // the executor has a cached block.
-      postExecutorStart("2")
-      // add a cached block
-      postBlockUpdate("2", "rdd_1_1", StorageLevel.MEMORY_ONLY)
-      // advance clock < cache timeout but > idle timeout, verify executor alive.
-      advanceAndVerify(1500, Set())
-      // advance past cache timeout, verify executor removed
-      advanceAndVerify(1500, Set("2"))
-
-      //////////////////////////////
-      // Executor idle check with shuffle block. Same idea as the cache test above.
-      postExecutorStart("3")
-      // add a shuffle block
-      mapOutputListener.mapOutputAdded(mapStatus("3"))
-      // advance past idle timeout, verify executor still there
-      advanceAndVerify(4000, Set())
-      // advance past shuffle timeout, verify executor removed
-      advanceAndVerify(10000, Set("3"))
-
-      //////////////////////////////
-      // Executor idle check with cached block that is removed. Make sure that the idle timeout
-      // triggers after a cached block is removed from the executor.
-      postExecutorStart("4")
-      // add a cached block
-      postBlockUpdate("4", "rdd_1_1", StorageLevel.MEMORY_ONLY)
-      // advance past idle timeout, verify executor still there
-      advanceAndVerify(1500, Set())
-      // remove cached block
-      postBlockUpdate("4", "rdd_1_1", StorageLevel.NONE)
-      // schedule same time, verify executor removed
-      advanceAndVerify(0, Set("4"))
-
-      //////////////////////////////
-      // Executor idle check with shuffle block that is removed. Same idea as previous test,
-      // for shuffle blocks.
-      postExecutorStart("5")
-      // add a shuffle block
-      mapOutputListener.mapOutputAdded(mapStatus("5"))
-      // advance past idle timeout, verify executor still there
-      advanceAndVerify(1500, Set())
-      // remove shuffle block
-      mapOutputListener.mapOutputRemoved(mapStatus("5"))
-      // schedule same time, verify executor removed
-      advanceAndVerify(0, Set("5"))
-    } finally {
-      manager.stop()
-      bus.stop()
-    }
+    val taskInfo1 = createTaskInfo(0, 0, "3")
+    post(sc.listenerBus, SparkListenerTaskStart(0, 0, taskInfo1))
+    // Verify taskStart not adding already removed executors.
+    assert(executorIds(manager).size === 2)
+    assert(executorIds(manager) === Set("1", "2"))
   }
 
   private def createSparkContext(

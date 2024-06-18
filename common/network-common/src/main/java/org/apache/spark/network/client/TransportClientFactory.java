@@ -290,9 +290,8 @@ public class TransportClientFactory implements Closeable {
     }
     connectionPool.clear();
 
-    if (workerGroup != null) {
+    if (workerGroup != null && !workerGroup.isShuttingDown()) {
       workerGroup.shutdownGracefully();
-      workerGroup = null;
     }
   }
 }

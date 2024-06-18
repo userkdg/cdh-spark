@@ -130,17 +130,11 @@ private[spark] class SparkSubmit extends Logging {
   }
 
   /**
-   * Submit the application using the provided parameters.
-   *
-   * This runs in two steps. First, we prepare the launch environment by setting up
-   * the appropriate classpath, system properties, and application arguments for
-   * running the child main class based on the cluster manager and the deploy mode.
-   * Second, we use this launch environment to invoke the main method of the child
-   * main class.
+   * Submit the application using the provided parameters, ensuring to first wrap
+   * in a doAs when --proxy-user is specified.
    */
   @tailrec
   private def submit(args: SparkSubmitArguments, uninitLog: Boolean): Unit = {
-    val (childArgs, childClasspath, sparkConf, childMainClass) = prepareSubmitEnvironment(args)
 
     def doRunMain(): Unit = {
       if (args.proxyUser != null) {
@@ -149,7 +143,7 @@ private[spark] class SparkSubmit extends Logging {
         try {
           proxyUser.doAs(new PrivilegedExceptionAction[Unit]() {
             override def run(): Unit = {
-              runMain(childArgs, childClasspath, sparkConf, childMainClass, args.verbose)
+              runMain(args, uninitLog)
             }
           })
         } catch {
@@ -164,13 +158,8 @@ private[spark] class SparkSubmit extends Logging {
             }
         }
       } else {
-        runMain(childArgs, childClasspath, sparkConf, childMainClass, args.verbose)
+        runMain(args, uninitLog)
       }
-    }
-
-    // Let the main class re-initialize the logging system once it starts.
-    if (uninitLog) {
-      Logging.uninitialize()
     }
 
     // In standalone cluster mode, there are two submission gateways:
@@ -534,10 +523,14 @@ private[spark] class SparkSubmit extends Logging {
       OptionAssigner(args.queue, YARN, ALL_DEPLOY_MODES, confKey = "spark.yarn.queue"),
       OptionAssigner(args.numExecutors, YARN, ALL_DEPLOY_MODES,
         confKey = "spark.executor.instances"),
-      OptionAssigner(args.pyFiles, YARN, ALL_DEPLOY_MODES, confKey = "spark.yarn.dist.pyFiles"),
-      OptionAssigner(args.jars, YARN, ALL_DEPLOY_MODES, confKey = "spark.yarn.dist.jars"),
-      OptionAssigner(args.files, YARN, ALL_DEPLOY_MODES, confKey = "spark.yarn.dist.files"),
-      OptionAssigner(args.archives, YARN, ALL_DEPLOY_MODES, confKey = "spark.yarn.dist.archives"),
+      OptionAssigner(args.pyFiles, YARN, ALL_DEPLOY_MODES, confKey = "spark.yarn.dist.pyFiles",
+        mergeFn = Some(mergeFileLists(_, _))),
+      OptionAssigner(args.jars, YARN, ALL_DEPLOY_MODES, confKey = "spark.yarn.dist.jars",
+        mergeFn = Some(mergeFileLists(_, _))),
+      OptionAssigner(args.files, YARN, ALL_DEPLOY_MODES, confKey = "spark.yarn.dist.files",
+        mergeFn = Some(mergeFileLists(_, _))),
+      OptionAssigner(args.archives, YARN, ALL_DEPLOY_MODES, confKey = "spark.yarn.dist.archives",
+        mergeFn = Some(mergeFileLists(_, _))),
       OptionAssigner(args.principal, YARN, ALL_DEPLOY_MODES, confKey = "spark.yarn.principal"),
       OptionAssigner(args.keytab, YARN, ALL_DEPLOY_MODES, confKey = "spark.yarn.keytab"),
 
@@ -598,7 +591,13 @@ private[spark] class SparkSubmit extends Logging {
           (deployMode & opt.deployMode) != 0 &&
           (clusterManager & opt.clusterManager) != 0) {
         if (opt.clOption != null) { childArgs += (opt.clOption, opt.value) }
-        if (opt.confKey != null) { sparkConf.set(opt.confKey, opt.value) }
+        if (opt.confKey != null) {
+          if (opt.mergeFn.isDefined && sparkConf.contains(opt.confKey)) {
+            sparkConf.set(opt.confKey, opt.mergeFn.get.apply(sparkConf.get(opt.confKey), opt.value))
+          } else {
+            sparkConf.set(opt.confKey, opt.value)
+          }
+        }
       }
     }
 
@@ -772,18 +771,25 @@ private[spark] class SparkSubmit extends Logging {
   }
 
   /**
-   * Run the main method of the child class using the provided launch environment.
+   * Run the main method of the child class using the submit arguments.
+   *
+   * This runs in two steps. First, we prepare the launch environment by setting up
+   * the appropriate classpath, system properties, and application arguments for
+   * running the child main class based on the cluster manager and the deploy mode.
+   * Second, we use this launch environment to invoke the main method of the child
+   * main class.
    *
    * Note that this main class will not be the one provided by the user if we're
    * running cluster deploy mode or python applications.
    */
-  private def runMain(
-      childArgs: Seq[String],
-      childClasspath: Seq[String],
-      sparkConf: SparkConf,
-      childMainClass: String,
-      verbose: Boolean): Unit = {
-    if (verbose) {
+  private def runMain(args: SparkSubmitArguments, uninitLog: Boolean): Unit = {
+    val (childArgs, childClasspath, sparkConf, childMainClass) = prepareSubmitEnvironment(args)
+    // Let the main class re-initialize the logging system once it starts.
+    if (uninitLog) {
+      Logging.uninitialize()
+    }
+
+    if (args.verbose) {
       logInfo(s"Main class:\n$childMainClass")
       logInfo(s"Arguments:\n${childArgs.mkString("\n")}")
       // sysProps may contain sensitive information, so redact before printing
@@ -1079,7 +1085,7 @@ private[spark] object SparkSubmitUtils {
     val sp: IBiblioResolver = new IBiblioResolver
     sp.setM2compatible(true)
     sp.setUsepoms(true)
-    sp.setRoot("http://dl.bintray.com/spark-packages/maven")
+    sp.setRoot("https://repos.spark-packages.org/")
     sp.setName("spark-packages")
     cr.add(sp)
     cr
@@ -1351,4 +1357,5 @@ private case class OptionAssigner(
     clusterManager: Int,
     deployMode: Int,
     clOption: String = null,
-    confKey: String = null)
+    confKey: String = null,
+    mergeFn: Option[(String, String) => String] = None)

@@ -37,9 +37,9 @@ MAKE_PIP=false
 MAKE_R=false
 NAME=none
 MVN="$SPARK_HOME/build/mvn"
-MVN_TARGET=package
 
 function exit_with_usage {
+  set +x
   echo "make-distribution.sh - tool for making binary distributions of Spark"
   echo ""
   echo "usage:"
@@ -68,10 +68,6 @@ while (( "$#" )); do
       ;;
     --name)
       NAME="$2"
-      shift
-      ;;
-    --target)
-      MVN_TARGET="$2"
       shift
       ;;
     --help)
@@ -130,34 +126,19 @@ if [ ! "$(command -v "$MVN")" ] ; then
     exit -1;
 fi
 
-# help:evaluate is not safe to multi-threaded builds, so if there is a "-T *" in the args, remove it
-ORIGINAL_ARGS=("$@")
-TRIMMED_ARGS=()
-i=0
-while [ $i -lt ${#ORIGINAL_ARGS[@]} ]; do
-  arg="${ORIGINAL_ARGS[$i]}"
-  if [ "-T" == $arg ]; then
-    # skip this arg and the next one
-    i=$((i + 1))
-  else
-    TRIMMED_ARGS+=($arg)
-  fi
-  i=$((i + 1))
-done
-
-VERSION=$("$MVN" help:evaluate -Dexpression=project.version $TRIMMED_ARGS 2>/dev/null\
+VERSION=$("$MVN" help:evaluate -Dexpression=project.version $@ 2>/dev/null\
     | grep -v "INFO"\
     | grep -v "WARNING"\
     | tail -n 1)
-SCALA_VERSION=$("$MVN" help:evaluate -Dexpression=scala.binary.version $TRIMMED_ARGS 2>/dev/null\
+SCALA_VERSION=$("$MVN" help:evaluate -Dexpression=scala.binary.version $@ 2>/dev/null\
     | grep -v "INFO"\
     | grep -v "WARNING"\
     | tail -n 1)
-SPARK_HADOOP_VERSION=$("$MVN" help:evaluate -Dexpression=hadoop.version $TRIMMED_ARGS 2>/dev/null\
+SPARK_HADOOP_VERSION=$("$MVN" help:evaluate -Dexpression=hadoop.version $@ 2>/dev/null\
     | grep -v "INFO"\
     | grep -v "WARNING"\
     | tail -n 1)
-SPARK_HIVE=$("$MVN" help:evaluate -Dexpression=project.activeProfiles -pl sql/hive $TRIMMED_ARGS 2>/dev/null\
+SPARK_HIVE=$("$MVN" help:evaluate -Dexpression=project.activeProfiles -pl sql/hive $@ 2>/dev/null\
     | grep -v "INFO"\
     | grep -v "WARNING"\
     | fgrep --count "<id>hive</id>";\
@@ -180,20 +161,12 @@ fi
 # Build uber fat JAR
 cd "$SPARK_HOME"
 
-export MAVEN_OPTS="${MAVEN_OPTS:--Xmx2g -XX:ReservedCodeCacheSize=512m}"
+export MAVEN_OPTS="${MAVEN_OPTS:--Xmx2g -XX:ReservedCodeCacheSize=1g}"
 
 # Store the command as an array because $MVN variable might have spaces in it.
 # Normal quoting tricks don't work.
 # See: http://mywiki.wooledge.org/BashFAQ/050
-BUILD_COMMAND=("$MVN" clean "$MVN_TARGET" -DskipTests $@)
-
-# We build spark artifacts in the local cauldron build in several passes. No-clean saves
-# time, since classes generated on the previous pass(es) are reused instead of compiling
-# them from scratch.
-if [ -n "${CAULDRON_NO_CLEAN}" ]; then
-  echo "CAULDRON_NO_CLEAN is set; will NOT perform mvn clean"
-  unset -v 'BUILD_COMMAND[1]'
-fi
+BUILD_COMMAND=("$MVN" clean package -DskipTests $@)
 
 # Actually build the jar
 echo -e "\nBuilding with..."
@@ -209,11 +182,6 @@ echo "Build flags: $@" >> "$DISTDIR/RELEASE"
 
 # Copy jars
 cp "$SPARK_HOME"/assembly/target/scala*/jars/* "$DISTDIR/jars/"
-
-if [ -d "$SPARK_HOME"/assembly/target/scala*/hive ]; then
-  mkdir -p "$DISTDIR/hive"
-  cp "$SPARK_HOME"/assembly/target/scala*/hive/* "$DISTDIR/hive/"
-fi
 
 # Only create the yarn directory if the yarn artifacts were built.
 if [ -f "$SPARK_HOME"/common/network-yarn/target/scala*/spark-*-yarn-shuffle.jar ]; then
@@ -313,13 +281,6 @@ if [ -d "$SPARK_HOME/R/lib/SparkR" ]; then
   cp -r "$SPARK_HOME/R/lib/SparkR" "$DISTDIR/R/lib"
   cp "$SPARK_HOME/R/lib/sparkr.zip" "$DISTDIR/R/lib"
 fi
-
-# CDH: remove scripts for which the actual code is not included.
-rm "$DISTDIR/bin/spark-sql"
-rm "$DISTDIR/bin/beeline"
-rm "$DISTDIR/bin/sparkR"
-rm "$DISTDIR/sbin/start-thriftserver.sh"
-rm "$DISTDIR/sbin/stop-thriftserver.sh"
 
 if [ "$MAKE_TGZ" == "true" ]; then
   TARDIR_NAME=spark-$VERSION-bin-$NAME

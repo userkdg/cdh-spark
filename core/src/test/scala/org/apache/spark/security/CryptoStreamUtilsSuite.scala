@@ -24,7 +24,7 @@ import java.nio.file.Files
 import java.util.{Arrays, Random, UUID}
 
 import com.google.common.io.ByteStreams
-import org.mockito.ArgumentMatchers.any
+import org.mockito.Matchers.any
 import org.mockito.Mockito._
 
 import org.apache.spark._
@@ -195,33 +195,6 @@ class CryptoStreamUtilsSuite extends SparkFunSuite {
     verify(wrapped, never()).read(any(classOf[ByteBuffer]))
     verify(decrypted, never()).close()
     verify(wrapped, times(1)).close()
-  }
-
-  test("CDH-61938: C5 configuration translation") {
-    val oldConf = new SparkConf(false)
-      .set("spark.shuffle.encryption.enabled", "true")
-      .set("spark.shuffle.encryption.keySizeBits", "256")
-      .set("spark.shuffle.encryption.keygen.algorithm", "FooBar")
-      .set("spark.shuffle.crypto.cipher.transformation", "BarFoo")
-      .set("spark.shuffle.crypto.some.conf", "SomeValue")
-
-    assert(oldConf.get(IO_ENCRYPTION_ENABLED))
-    assert(oldConf.get(IO_ENCRYPTION_KEY_SIZE_BITS) === 256)
-    assert(oldConf.get(IO_ENCRYPTION_KEYGEN_ALGORITHM) === "FooBar")
-    assert(oldConf.get(IO_CRYPTO_CIPHER_TRANSFORMATION) === "BarFoo")
-
-    val translated = toCryptoConf(oldConf)
-    assert(translated.get(CryptoUtils.COMMONS_CRYPTO_CONFIG_PREFIX + "some.conf") === "SomeValue")
-
-    val mixedConf = new SparkConf(false)
-      .set(SPARK_IO_ENCRYPTION_COMMONS_CONFIG_PREFIX + "some.conf", "Value1")
-      .set(C5_SPARK_CRYPTO_CONFIG_PREFIX + "some.conf", "Value2")
-      .set(C5_SPARK_CRYPTO_CONFIG_PREFIX + "other.conf", "Value3")
-
-    val mixedTranslation = toCryptoConf(mixedConf)
-    assert(mixedTranslation.size() === 1)
-    assert(mixedTranslation.get(CryptoUtils.COMMONS_CRYPTO_CONFIG_PREFIX + "some.conf") ===
-      "Value1")
   }
 
   private def createConf(extra: (String, String)*): SparkConf = {

@@ -49,19 +49,6 @@ package object config {
     .bytesConf(ByteUnit.MiB)
     .createOptional
 
-  private[spark] val DRIVER_LOG_DFS_DIR =
-    ConfigBuilder("spark.driver.log.dfsDir").stringConf.createOptional
-
-  private[spark] val DRIVER_LOG_LAYOUT =
-    ConfigBuilder("spark.driver.log.layout")
-      .stringConf
-      .createOptional
-
-  private[spark] val DRIVER_LOG_PERSISTTODFS =
-    ConfigBuilder("spark.driver.log.persistToDfs.enabled")
-      .booleanConf
-      .createWithDefault(false)
-
   private[spark] val EVENT_LOG_COMPRESS =
     ConfigBuilder("spark.eventLog.compress")
       .booleanConf
@@ -69,11 +56,6 @@ package object config {
 
   private[spark] val EVENT_LOG_BLOCK_UPDATES =
     ConfigBuilder("spark.eventLog.logBlockUpdates.enabled")
-      .booleanConf
-      .createWithDefault(false)
-
-  private[spark] val EVENT_LOG_ALLOW_EC =
-    ConfigBuilder("spark.eventLog.allowErasureCoding")
       .booleanConf
       .createWithDefault(false)
 
@@ -88,16 +70,6 @@ package object config {
     .bytesConf(ByteUnit.KiB)
     .createWithDefaultString("100k")
 
-  private[spark] val EVENT_LOG_STAGE_EXECUTOR_METRICS =
-    ConfigBuilder("spark.eventLog.logStageExecutorMetrics.enabled")
-      .booleanConf
-      .createWithDefault(false)
-
-  private[spark] val EVENT_LOG_PROCESS_TREE_METRICS =
-    ConfigBuilder("spark.eventLog.logStageExecutorProcessTreeMetrics.enabled")
-      .booleanConf
-      .createWithDefault(false)
-
   private[spark] val EVENT_LOG_OVERWRITE =
     ConfigBuilder("spark.eventLog.overwrite").booleanConf.createWithDefault(false)
 
@@ -106,6 +78,11 @@ package object config {
 
   private[spark] val EXECUTOR_CLASS_PATH =
     ConfigBuilder(SparkLauncher.EXECUTOR_EXTRA_CLASSPATH).stringConf.createOptional
+
+  private[spark] val EXECUTOR_HEARTBEAT_INTERVAL =
+    ConfigBuilder("spark.executor.heartbeatInterval")
+      .timeConf(TimeUnit.MILLISECONDS)
+      .createWithDefaultString("10s")
 
   private[spark] val EXECUTOR_JAVA_OPTIONS =
     ConfigBuilder(SparkLauncher.EXECUTOR_EXTRA_JAVA_OPTIONS).stringConf.createOptional
@@ -183,20 +160,6 @@ package object config {
   private[spark] val PRINCIPAL = ConfigBuilder("spark.yarn.principal")
     .doc("Name of the Kerberos principal.")
     .stringConf.createOptional
-
-  private[spark] val KERBEROS_RELOGIN_PERIOD = ConfigBuilder("spark.yarn.kerberos.relogin.period")
-    .timeConf(TimeUnit.SECONDS)
-    .createWithDefaultString("1m")
-
-  private[spark] val KERBEROS_RENEWAL_CREDENTIALS =
-    ConfigBuilder("spark.kerberos.renewal.credentials")
-      .doc(
-        "Which credentials to use when renewing delegation tokens for executors. Can be either " +
-        "'keytab', the default, which requires a keytab to be provided, or 'ccache', which uses " +
-        "the local credentials cache.")
-      .stringConf
-      .checkValues(Set("keytab", "ccache"))
-      .createWithDefault("keytab")
 
   private[spark] val EXECUTOR_INSTANCES = ConfigBuilder("spark.executor.instances")
     .intConf
@@ -282,7 +245,7 @@ package object config {
   private[spark] val LISTENER_BUS_EVENT_QUEUE_CAPACITY =
     ConfigBuilder("spark.scheduler.listenerbus.eventqueue.capacity")
       .intConf
-      .checkValue(_ > 0, "The capacity of listener bus event queue must not be negative")
+      .checkValue(_ > 0, "The capacity of listener bus event queue must be positive")
       .createWithDefault(10000)
 
   private[spark] val LISTENER_BUS_METRICS_MAX_LISTENER_CLASSES_TIMED =
@@ -342,13 +305,6 @@ package object config {
     .doc("Address where to bind network listen sockets on the driver.")
     .fallbackConf(DRIVER_HOST_ADDRESS)
 
-  private[spark] val EXECUTOR_RPC_BIND_TO_ALL =
-    ConfigBuilder("spark.executor.rpc.bindToAll")
-      .doc("Whether to bind network listen sockets of the executors to all IPv4 addresses " +
-        "(to the address 0.0.0.0).")
-      .booleanConf
-      .createWithDefault(false)
-
   private[spark] val BLOCK_MANAGER_PORT = ConfigBuilder("spark.blockManager.port")
     .doc("Port to use for the block manager when a more specific setting is not provided.")
     .intConf
@@ -402,7 +358,7 @@ package object config {
         "a property key or value, the value is redacted from the environment UI and various logs " +
         "like YARN and event logs.")
       .regexConf
-      .createWithDefault("(?i)secret|password".r)
+      .createWithDefault("(?i)secret|password|token|access[.]key".r)
 
   private[spark] val STRING_REDACTION_PATTERN =
     ConfigBuilder("spark.redaction.string.regex")
@@ -427,37 +383,6 @@ package object config {
       .booleanConf
       .createWithDefault(false)
 
-  private[spark] val AUTH_SECRET_FILE =
-    ConfigBuilder("spark.authenticate.secret.file")
-      .doc("Path to a file that contains the authentication secret to use. The secret key is " +
-        "loaded from this path on both the driver and the executors if overrides are not set for " +
-        "either entity (see below). File-based secret keys are only allowed when using " +
-        "Kubernetes.")
-      .stringConf
-      .createOptional
-
-  private[spark] val AUTH_SECRET_FILE_DRIVER =
-    ConfigBuilder("spark.authenticate.secret.driver.file")
-      .doc("Path to a file that contains the authentication secret to use. Loaded by the " +
-        "driver. In Kubernetes client mode it is often useful to set a different secret " +
-        "path for the driver vs. the executors, since the driver may not be running in " +
-        "a pod unlike the executors. If this is set, an accompanying secret file must " +
-        "be specified for the executors. The fallback configuration allows the same path to be " +
-        "used for both the driver and the executors when running in cluster mode. File-based " +
-        "secret keys are only allowed when using Kubernetes.")
-      .fallbackConf(AUTH_SECRET_FILE)
-
-  private[spark] val AUTH_SECRET_FILE_EXECUTOR =
-    ConfigBuilder("spark.authenticate.secret.executor.file")
-      .doc("Path to a file that contains the authentication secret to use. Loaded by the " +
-        "executors only. In Kubernetes client mode it is often useful to set a different " +
-        "secret path for the driver vs. the executors, since the driver may not be running " +
-        "in a pod unlike the executors. If this is set, an accompanying secret file must be " +
-        "specified for the executors. The fallback configuration allows the same path to be " +
-        "used for both the driver and the executors when running in cluster mode. File-based " +
-        "secret keys are only allowed when using Kubernetes.")
-      .fallbackConf(AUTH_SECRET_FILE)
-
   private[spark] val NETWORK_ENCRYPTION_ENABLED =
     ConfigBuilder("spark.network.crypto.enabled")
       .booleanConf
@@ -469,8 +394,8 @@ package object config {
       .doc("The chunk size in bytes during writing out the bytes of ChunkedByteBuffer.")
       .bytesConf(ByteUnit.BYTE)
       .checkValue(_ <= ByteArrayMethods.MAX_ROUNDED_ARRAY_LENGTH,
-        "The chunk size during writing out the bytes of" +
-        " ChunkedByteBuffer should not larger than Int.MaxValue - 15.")
+        "The chunk size during writing out the bytes of ChunkedByteBuffer should" +
+          s" be less than or equal to ${ByteArrayMethods.MAX_ROUNDED_ARRAY_LENGTH}.")
       .createWithDefault(64 * 1024 * 1024)
 
   private[spark] val CHECKPOINT_COMPRESS =
@@ -542,7 +467,7 @@ package object config {
         "made in creating intermediate shuffle files.")
       .bytesConf(ByteUnit.KiB)
       .checkValue(v => v > 0 && v <= ByteArrayMethods.MAX_ROUNDED_ARRAY_LENGTH / 1024,
-        s"The file buffer size must be greater than 0 and less than" +
+        s"The file buffer size must be positive and less than or equal to" +
           s" ${ByteArrayMethods.MAX_ROUNDED_ARRAY_LENGTH / 1024}.")
       .createWithDefaultString("32k")
 
@@ -552,7 +477,7 @@ package object config {
         "is written in unsafe shuffle writer. In KiB unless otherwise specified.")
       .bytesConf(ByteUnit.KiB)
       .checkValue(v => v > 0 && v <= ByteArrayMethods.MAX_ROUNDED_ARRAY_LENGTH / 1024,
-        s"The buffer size must be greater than 0 and less than" +
+        s"The buffer size must be positive and less than or equal to" +
           s" ${ByteArrayMethods.MAX_ROUNDED_ARRAY_LENGTH / 1024}.")
       .createWithDefaultString("32k")
 
@@ -560,9 +485,8 @@ package object config {
     ConfigBuilder("spark.shuffle.spill.diskWriteBufferSize")
       .doc("The buffer size, in bytes, to use when writing the sorted records to an on-disk file.")
       .bytesConf(ByteUnit.BYTE)
-      .checkValue(v => v > 12 && v <= ByteArrayMethods.MAX_ROUNDED_ARRAY_LENGTH,
-        s"The buffer size must be greater than 12 and less than or equal to " +
-          s"${ByteArrayMethods.MAX_ROUNDED_ARRAY_LENGTH}.")
+      .checkValue(v => v > 0 && v <= Int.MaxValue,
+        s"The buffer size must be greater than 0 and less than ${Int.MaxValue}.")
       .createWithDefault(1024 * 1024)
 
   private[spark] val UNROLL_MEMORY_CHECK_PERIOD =
@@ -657,21 +581,6 @@ package object config {
       .doc("How long to wait before retrying to fetch new credentials after a failure.")
       .timeConf(TimeUnit.SECONDS)
       .createWithDefaultString("1h")
-
-  private[spark] val SHUFFLE_DETECT_CORRUPT =
-    ConfigBuilder("spark.shuffle.detectCorrupt")
-      .doc("Whether to detect any corruption in fetched blocks.")
-      .booleanConf
-      .createWithDefault(true)
-
-  private[spark] val SHUFFLE_DETECT_CORRUPT_MEMORY =
-    ConfigBuilder("spark.shuffle.detectCorrupt.useExtraMemory")
-      .doc("If enabled, part of a compressed/encrypted stream will be de-compressed/de-crypted " +
-        "by using extra memory to detect early corruption. Any IOException thrown will cause " +
-        "the task to be retried once and if it fails again with same exception, then " +
-        "FetchFailedException will be thrown to retry previous stage")
-      .booleanConf
-      .createWithDefault(false)
 
   private[spark] val SHUFFLE_MIN_NUM_PARTS_TO_HIGHLY_COMPRESS =
     ConfigBuilder("spark.shuffle.minNumPartitionsToHighlyCompress")
